@@ -1,21 +1,24 @@
-"""Unified KG loader: works for the dummy KG and FB15k-237 (same TSV layout).
+"""Loader for KG datasets that follow the FB15k-237 file layout.
 
-Expected directory layout::
+The loader takes a directory like::
 
-    <dataset_dir>/
+    datasets/dummy_kg/
         train.txt              REQUIRED - tab-separated head, relation, tail
-        valid.txt              OPTIONAL (may be empty)
-        test.txt               OPTIONAL (may be empty)
+        valid.txt              OPTIONAL - validation split (may be empty)
+        test.txt               OPTIONAL - test split (may be empty)
         entity_metadata.txt    OPTIONAL - entity_id <TAB> display_name <TAB> type
         relation_metadata.txt  OPTIONAL - relation_id <TAB> display_name
 
-Missing metadata files are handled gracefully:
-- display_name defaults to the entity_id / relation_id itself
-- type defaults to 'unknown'
+and returns a `KnowledgeGraph` object that contains everything downstream
+code needs: vocabularies, integer-indexed triples, pretty-print helpers.
 
-The loader is triple-level - no adjacency tensor is built. Callers that need
-adjacency can call `triples_to_adjacency_tensor(kg.triples_idx, ...)` on
-demand (e.g. for visualisation).
+There is intentionally no adjacency tensor in this object. Callers that need
+adjacency build it on demand from the triples via
+`kg_data.adjacency.triples_to_adjacency_tensor`.
+
+This format is FB15k-237-compatible: the same loader works on the dummy KG
+and (later) on the full FB15k-237 dataset, with no code change at the call
+site - just point at a different directory.
 """
 from __future__ import annotations
 
@@ -24,132 +27,195 @@ from pathlib import Path
 from typing import Dict, List, Set, Tuple
 
 
+# (head_index, relation_index, tail_index) - the canonical "triple" form
 Triple = Tuple[int, int, int]
 
 
 @dataclass
 class KnowledgeGraph:
-    """Everything a downstream consumer needs about a loaded KG (triple-level)."""
-    # Raw string triples - original form from the TSV
-    triples: List[Tuple[str, str, str]]
-    valid_triples: List[Tuple[str, str, str]]
-    test_triples: List[Tuple[str, str, str]]
+    """A loaded knowledge graph plus all the metadata downstream code uses.
 
-    # Index triples - the form downstream code (TRIC, dataset builder, model)
-    # consumes. (h_idx, r_idx, t_idx) using the vocabularies below.
-    triples_idx: List[Triple]
-    triple_set_idx: Set[Triple]              # O(1) "edge exists" check
+    The dataclass holds TWO representations of the same triples:
+      * `triples`     - the raw form from the TSV file (strings like
+                        "/dummy/Alice", "/dummy/born_in"). Mostly for
+                        debugging and round-tripping back to disk.
+      * `triples_idx` - the integer-indexed form. This is what every
+                        downstream piece of code (TRIC, dataset builder,
+                        the model) actually consumes.
 
-    entity_id_to_row: Dict[str, int]
-    relation_id_to_channel: Dict[str, int]
+    The vocab maps (`entity_id_to_row`, `relation_id_to_channel`) are the
+    bridge between those two forms.
+    """
+    # Raw string triples - original form from the TSV files
+    triples:        List[Tuple[str, str, str]]   # training split
+    valid_triples:  List[Tuple[str, str, str]]   # validation split (may be [])
+    test_triples:   List[Tuple[str, str, str]]   # test split (may be [])
 
-    node_labels: Dict[int, str]              # row_idx -> display name
-    node_types: Dict[int, str]               # row_idx -> entity type
-    relation_names: List[str]                # channel_idx -> display name
-    dataset_name: str = ""
+    # Integer-indexed triples - what downstream code consumes
+    triples_idx:    List[Triple]
+    triple_set_idx: Set[Triple]                  # set form, O(1) "exists?"
+
+    # Vocabulary maps (string -> integer)
+    entity_id_to_row:       Dict[str, int]       # e.g. {"/dummy/Alice": 0}
+    relation_id_to_channel: Dict[str, int]       # e.g. {"/dummy/born_in": 0}
+
+    # Pretty-print helpers (integer -> human-readable string)
+    node_labels:    Dict[int, str]               # row_index -> display name
+    node_types:     Dict[int, str]               # row_index -> type string
+    relation_names: List[str]                    # channel_index -> display name
+
+    dataset_name:   str = ""
 
     @property
     def num_nodes(self) -> int:
+        """Number of unique entities in the training split."""
         return len(self.entity_id_to_row)
 
     @property
     def num_relations(self) -> int:
+        """Number of unique relations in the training split."""
         return len(self.relation_id_to_channel)
 
 
 def _read_triples_tsv(path: Path) -> List[Tuple[str, str, str]]:
-    """Read tab-separated (h, r, t) string triples. Returns [] if file missing or empty."""
+    """Read tab-separated string triples from a file. Returns [] if missing."""
     if not path.exists():
         return []
-    rows: List[Tuple[str, str, str]] = []
-    with path.open("r", encoding="utf-8") as f:
-        for line in f:
-            line = line.rstrip("\n")
-            if not line.strip():
-                continue
-            parts = line.split("\t")
-            if len(parts) != 3:
+    parsed_triples: List[Tuple[str, str, str]] = []
+    with path.open("r", encoding="utf-8") as input_file:
+        for raw_line in input_file:
+            raw_line = raw_line.rstrip("\n")
+            if not raw_line.strip():
+                continue   # skip blank lines
+            columns = raw_line.split("\t")
+            if len(columns) != 3:
                 raise ValueError(
                     f"{path}: expected 3 tab-separated fields, "
-                    f"got {len(parts)} in line: {line!r}"
+                    f"got {len(columns)} in line: {raw_line!r}"
                 )
-            rows.append((parts[0], parts[1], parts[2]))
-    return rows
+            parsed_triples.append((columns[0], columns[1], columns[2]))
+    return parsed_triples
 
 
-def _read_metadata(path: Path, expected_cols: int) -> List[List[str]]:
-    """Read a tab-separated metadata file. Returns [] if missing."""
+def _read_metadata_tsv(path: Path, expected_num_columns: int) -> List[List[str]]:
+    """Read a tab-separated metadata file (any number of columns). Returns []
+    if the file doesn't exist. Pads short rows with empty strings."""
     if not path.exists():
         return []
     rows: List[List[str]] = []
-    with path.open("r", encoding="utf-8") as f:
-        for line in f:
-            line = line.rstrip("\n")
-            if not line.strip():
+    with path.open("r", encoding="utf-8") as input_file:
+        for raw_line in input_file:
+            raw_line = raw_line.rstrip("\n")
+            if not raw_line.strip():
                 continue
-            parts = line.split("\t")
-            while len(parts) < expected_cols:
-                parts.append("")
-            rows.append(parts[:expected_cols])
+            columns = raw_line.split("\t")
+            while len(columns) < expected_num_columns:
+                columns.append("")
+            rows.append(columns[:expected_num_columns])
     return rows
 
 
-def load_kg(dataset_dir: str | Path) -> KnowledgeGraph:
-    """Load a KG from a directory of TSV files (FB15k-237-compatible layout)."""
-    dataset_dir = Path(dataset_dir)
-    if not dataset_dir.is_dir():
-        raise FileNotFoundError(f"Dataset directory not found: {dataset_dir}")
+def load_kg(dataset_directory: str | Path) -> KnowledgeGraph:
+    """Load a KG from a directory of TSV files (FB15k-237-compatible layout).
 
-    train_triples = _read_triples_tsv(dataset_dir / "train.txt")
-    valid_triples = _read_triples_tsv(dataset_dir / "valid.txt")
-    test_triples  = _read_triples_tsv(dataset_dir / "test.txt")
-    if not train_triples:
-        raise ValueError(f"No training triples found at {dataset_dir / 'train.txt'}")
+    Steps:
+      1. Read the three triple files (train.txt, valid.txt, test.txt).
+      2. Build entity & relation vocabularies in "first-seen" order from the
+         training triples.
+      3. Read optional metadata files (display names and entity types).
+      4. Translate each training triple into integer-indexed form.
+      5. Wrap everything in a KnowledgeGraph dataclass and return it.
 
-    # Build entity / relation vocabularies from the training split.
-    entity_ids_in_order: List[str] = []
+    Parameters
+    ----------
+    dataset_directory : str or Path
+        Path to a directory containing at least `train.txt`.
+
+    Returns
+    -------
+    KnowledgeGraph - see the dataclass docstring for what's inside.
+    """
+    dataset_directory = Path(dataset_directory)
+    if not dataset_directory.is_dir():
+        raise FileNotFoundError(f"Dataset directory not found: {dataset_directory}")
+
+    # ── Step 1: read the three triple split files ─────────────────────
+    training_triples_strings   = _read_triples_tsv(dataset_directory / "train.txt")
+    validation_triples_strings = _read_triples_tsv(dataset_directory / "valid.txt")
+    test_triples_strings       = _read_triples_tsv(dataset_directory / "test.txt")
+    if not training_triples_strings:
+        raise ValueError(f"No training triples found at {dataset_directory / 'train.txt'}")
+
+    # ── Step 2: build entity & relation vocabularies ──────────────────
+    # First-seen ordering: row index 0 is the first entity that appears in
+    # the training data, row 1 is the second, and so on. Same for relations.
+    entity_ids_in_order:   List[str] = []
     relation_ids_in_order: List[str] = []
-    seen_e, seen_r = set(), set()
-    for h, r, t in train_triples:
-        for e in (h, t):
-            if e not in seen_e:
-                seen_e.add(e)
-                entity_ids_in_order.append(e)
-        if r not in seen_r:
-            seen_r.add(r)
-            relation_ids_in_order.append(r)
+    entities_already_seen:  set = set()
+    relations_already_seen: set = set()
 
-    entity_id_to_row       = {eid: i for i, eid in enumerate(entity_ids_in_order)}
-    relation_id_to_channel = {rid: i for i, rid in enumerate(relation_ids_in_order)}
+    for head_string, relation_string, tail_string in training_triples_strings:
+        for entity_string in (head_string, tail_string):
+            if entity_string not in entities_already_seen:
+                entities_already_seen.add(entity_string)
+                entity_ids_in_order.append(entity_string)
+        if relation_string not in relations_already_seen:
+            relations_already_seen.add(relation_string)
+            relation_ids_in_order.append(relation_string)
 
-    # Optional metadata
-    entity_meta_rows = _read_metadata(dataset_dir / "entity_metadata.txt", expected_cols=3)
-    eid_to_display: Dict[str, str] = {}
-    eid_to_type:    Dict[str, str] = {}
-    for eid, disp, etype in entity_meta_rows:
-        eid_to_display[eid] = disp or eid
-        eid_to_type[eid]    = etype or "unknown"
+    entity_id_to_row       = {entity_id: row_index
+                              for row_index, entity_id in enumerate(entity_ids_in_order)}
+    relation_id_to_channel = {relation_id: channel_index
+                              for channel_index, relation_id in enumerate(relation_ids_in_order)}
 
-    rel_meta_rows = _read_metadata(dataset_dir / "relation_metadata.txt", expected_cols=2)
-    rid_to_display: Dict[str, str] = {}
-    for rid, disp in rel_meta_rows:
-        rid_to_display[rid] = disp or rid
+    # ── Step 3: read optional metadata ────────────────────────────────
+    entity_metadata_rows = _read_metadata_tsv(
+        dataset_directory / "entity_metadata.txt", expected_num_columns=3,
+    )
+    entity_id_to_display_name: Dict[str, str] = {}
+    entity_id_to_type:         Dict[str, str] = {}
+    for entity_id, display_name, entity_type in entity_metadata_rows:
+        entity_id_to_display_name[entity_id] = display_name or entity_id
+        entity_id_to_type[entity_id]         = entity_type or "unknown"
 
-    node_labels    = {row: eid_to_display.get(eid, eid)        for eid, row in entity_id_to_row.items()}
-    node_types     = {row: eid_to_type.get(eid, "unknown")     for eid, row in entity_id_to_row.items()}
-    relation_names = [rid_to_display.get(rid, rid) for rid in relation_ids_in_order]
+    relation_metadata_rows = _read_metadata_tsv(
+        dataset_directory / "relation_metadata.txt", expected_num_columns=2,
+    )
+    relation_id_to_display_name: Dict[str, str] = {}
+    for relation_id, display_name in relation_metadata_rows:
+        relation_id_to_display_name[relation_id] = display_name or relation_id
 
-    # Vocab-mapped triple form (what downstream code uses)
-    triples_idx: List[Triple] = [
-        (entity_id_to_row[h], relation_id_to_channel[r], entity_id_to_row[t])
-        for h, r, t in train_triples
+    # Pretty-print helpers, keyed by integer index (the form models use)
+    node_labels = {
+        row_index: entity_id_to_display_name.get(entity_id, entity_id)
+        for entity_id, row_index in entity_id_to_row.items()
+    }
+    node_types = {
+        row_index: entity_id_to_type.get(entity_id, "unknown")
+        for entity_id, row_index in entity_id_to_row.items()
+    }
+    relation_names = [
+        relation_id_to_display_name.get(relation_id, relation_id)
+        for relation_id in relation_ids_in_order
     ]
+
+    # ── Step 4: integer-indexed triple form ───────────────────────────
+    triples_idx: List[Triple] = [
+        (
+            entity_id_to_row[head_string],
+            relation_id_to_channel[relation_string],
+            entity_id_to_row[tail_string],
+        )
+        for head_string, relation_string, tail_string in training_triples_strings
+    ]
+    # Same content as triples_idx but as a set, for O(1) "exists?" checks.
     triple_set_idx: Set[Triple] = set(triples_idx)
 
+    # ── Step 5: wrap and return ───────────────────────────────────────
     return KnowledgeGraph(
-        triples=train_triples,
-        valid_triples=valid_triples,
-        test_triples=test_triples,
+        triples=training_triples_strings,
+        valid_triples=validation_triples_strings,
+        test_triples=test_triples_strings,
         triples_idx=triples_idx,
         triple_set_idx=triple_set_idx,
         entity_id_to_row=entity_id_to_row,
@@ -157,5 +223,5 @@ def load_kg(dataset_dir: str | Path) -> KnowledgeGraph:
         node_labels=node_labels,
         node_types=node_types,
         relation_names=relation_names,
-        dataset_name=dataset_dir.name,
+        dataset_name=dataset_directory.name,
     )

@@ -1,15 +1,17 @@
 """Build (clean_triple, target_triple) training pairs directly from a triple list.
 
-Replaces the old `build_kg_paired_dataset` + `build_triple_pair_tensor` flow,
-which went through an `(N, N, R)` adjacency intermediate. This version is
-triple-level end-to-end - the only representation that scales to FB15k-237.
+For each round (we do `num_rounds` of them) we do three things:
+  1. Optionally permute entity indices - data augmentation.
+  2. Apply TRIC corruption to the (permuted) triple list. TRIC returns the
+     modified triple list AND a list of "edit records" - one per successful
+     corruption step.
+  3. Harvest the SUBSTITUTION edits (records where both clean and corrupted
+     are populated) and turn them into rows of a (M, 6) long tensor:
+        [clean_h, clean_r, clean_t,  target_h, target_r, target_t]
+     That tensor is what the model trains on.
 
-Per round:
-  1. Optionally permute entity indices (data augmentation across many KGs).
-  2. Apply `corruption_fn` to the (permuted) triple list - returns
-     (corrupted_triples, edit_records).
-  3. Harvest the substitution edits (records where both clean and corrupted
-     triples are populated) as (clean, corrupted) training pairs.
+There is no adjacency tensor anywhere in this builder - the whole flow is
+triple-level, which is what makes it scale to FB15k-237 size.
 """
 from typing import Callable, List, Tuple
 
@@ -17,14 +19,15 @@ import numpy as np
 import torch
 
 
+# (head_index, relation_index, tail_index)
 Triple = Tuple[int, int, int]
 
 
 def build_triple_pair_dataset(
-    triples: List[Triple],
-    num_pairs: int,
-    num_corruptions: int,
-    rng: np.random.Generator,
+    clean_triples: List[Triple],
+    num_rounds: int,
+    num_corruption_steps_per_round: int,
+    random_generator: np.random.Generator,
     *,
     num_entities: int,
     num_relations: int,
@@ -35,46 +38,86 @@ def build_triple_pair_dataset(
 
     Parameters
     ----------
-    triples         : list of clean (h_idx, r_idx, t_idx) tuples
-    num_pairs       : int  number of (permutation, corruption) rounds
-    num_corruptions : int  passed to corruption_fn
-    rng             : np.random.Generator
-    num_entities    : |E|
-    num_relations   : |R|
-    corruption_fn   : callable(triples, num_corruptions, rng) ->
-                      (corrupted_triples, edit_records).
-                      Pre-bind kwargs via functools.partial.
-    permute_entities: bool. If True, each round randomly remaps entity
-                      indices before corrupting - data augmentation so the
-                      model sees the same KG structure under many entity ids.
+    clean_triples
+        The clean KG as a list of (head_index, relation_index, tail_index).
+    num_rounds
+        How many "passes" to do. Each pass optionally permutes the KG and
+        applies TRIC. Roughly: more rounds -> more training pairs.
+    num_corruption_steps_per_round
+        How many edits TRIC attempts per round. Passed straight through to
+        corruption_fn.
+    random_generator
+        numpy random Generator. Same generator + same input -> same output.
+    num_entities, num_relations
+        Sizes of the entity / relation vocabularies. Needed for permutation
+        and also passed to corruption_fn (which needs them for add_spurious
+        and swap ops).
+    corruption_fn
+        A callable with signature ``corruption_fn(triples, num_corruption_steps,
+        rng) -> (corrupted_triples, edit_records)``. Typically TRIC pre-bound
+        with functools.partial. The returned edit_records are what we
+        actually harvest training pairs from.
+    permute_entities
+        If True (default), each round random-remaps the entity index space.
+        This is a cheap data-augmentation trick: the same KG structure is
+        presented to the model with many different entity ID assignments,
+        which forces the model to learn the *pattern* rather than specific
+        IDs. Without this, the model would only see 18 distinct clean
+        triples in the dummy KG and risk overfitting.
 
     Returns
     -------
-    torch.Tensor of shape (M, 6), dtype long.
-    Columns: [c_h, c_r, c_t, t_h, t_r, t_t].
-    M depends on how many substitution-style edits succeeded across all
-    rounds (pure adds/removes are excluded - they have no (clean, corrupted)
-    correspondence).
+    torch.Tensor of shape (M, 6), dtype torch.long.
+    Columns: [clean_h, clean_r, clean_t, target_h, target_r, target_t].
+
+    M = total number of substitution-style edits harvested across all rounds.
+    Pure adds and pure removes (which lack a (clean, corrupted) pair) are
+    excluded.
     """
-    all_rows: List[List[int]] = []
+    # All rows we'll eventually stack into the output tensor
+    triple_pair_rows: List[List[int]] = []
 
-    for _ in range(num_pairs):
+    for _ in range(num_rounds):
+        # ── Step 1: optionally permute entity indices ─────────────────
         if permute_entities:
-            perm = rng.permutation(num_entities)
-            cur_triples = [(int(perm[h]), r, int(perm[t])) for h, r, t in triples]
+            # entity_permutation[i] = where original entity i lands.
+            # If perm = [3, 7, 1, ...] then "Alice" (originally row 0)
+            # gets row 3 in this round.
+            entity_permutation = random_generator.permutation(num_entities)
+            current_triples = [
+                (
+                    int(entity_permutation[head_index]),
+                    relation_index,
+                    int(entity_permutation[tail_index]),
+                )
+                for head_index, relation_index, tail_index in clean_triples
+            ]
         else:
-            cur_triples = list(triples)
+            current_triples = list(clean_triples)
 
-        _corrupted, edits = corruption_fn(cur_triples, num_corruptions, rng)
+        # ── Step 2: apply TRIC corruption ─────────────────────────────
+        # corruption_fn returns (corrupted_triples, edit_records).
+        # We only need edit_records here; the corrupted KG itself is
+        # implicit in the records.
+        _corrupted_triples, edit_records = corruption_fn(
+            current_triples, num_corruption_steps_per_round, random_generator,
+        )
 
-        for clean_tri, corr_tri in edits:
-            if clean_tri is None or corr_tri is None:
-                continue   # pure add/remove - no (clean, corrupted) pair
-            all_rows.append([
-                clean_tri[0], clean_tri[1], clean_tri[2],
-                corr_tri[0],  corr_tri[1],  corr_tri[2],
+        # ── Step 3: harvest substitution edits as training rows ───────
+        # Each "edit" looks like (clean_triple, corrupted_triple). For pure
+        # adds, clean_triple is None; for pure removes, corrupted_triple is
+        # None. We only keep edits where BOTH are populated, because the
+        # model trains on (input, target) pairs.
+        for clean_triple, corrupted_triple in edit_records:
+            if clean_triple is None or corrupted_triple is None:
+                continue   # skip pure add/remove ops - no training pair to form
+            triple_pair_rows.append([
+                clean_triple[0],     clean_triple[1],     clean_triple[2],
+                corrupted_triple[0], corrupted_triple[1], corrupted_triple[2],
             ])
 
-    if not all_rows:
+    # Empty case - no successful corruptions across all rounds
+    if not triple_pair_rows:
         return torch.zeros((0, 6), dtype=torch.long)
-    return torch.tensor(all_rows, dtype=torch.long)
+
+    return torch.tensor(triple_pair_rows, dtype=torch.long)

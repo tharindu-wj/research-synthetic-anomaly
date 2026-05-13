@@ -1,35 +1,54 @@
-"""TRIC-style triple corruption operating on a triple set (no adjacency tensor).
+"""TRIC-style triple corruption (Senaratne et al., ESWC 2023).
 
-Implements a subset of the TRIC operations (Senaratne et al., ESWC 2023, Table 1):
+This module turns a "clean" knowledge graph (a list of triples) into a
+"corrupted" one by applying a few random edits. The corruptions follow the
+TRIC taxonomy, where Table 1 of the paper lists 12 ways a triple can be
+distorted. We implement the seven that apply to a binary directed multi-
+relational graph (no literals).
 
+A triple is a 3-tuple of integer indices: (head_index, relation_index,
+tail_index). Each index is a row in an entity vocabulary or a relation
+vocabulary - see kg_data.loader.load_kg for how those vocabularies are built.
+
+The module returns BOTH:
+  * the corrupted triple list (the new KG), and
+  * a list of "edit records": (clean_triple_or_None, corrupted_triple_or_None)
+    documenting each successful corruption step. The dataset builder uses
+    those records to build (clean, corrupted) training pairs without having
+    to re-diff the two KGs.
+
+TRIC operations supported here:
     remove                  Delete a random existing triple.        (TRIC 1-4)
     swap_subject_same_type  (h, r, t) -> (h', r, t),
-                            type[h'] == type[h].                    (TRIC 1)
+                            type(h') == type(h).                    (TRIC 1)
     swap_object_same_type   (h, r, t) -> (h, r, t'),
-                            type[t'] == type[t].                    (TRIC 2)
+                            type(t') == type(t).                    (TRIC 2)
     change_relation         (h, r, t) -> (h, r', t).                (TRIC 3)
     swap_subject_diff_type  (h, r, t) -> (h', r, t),
-                            type[h'] != type[h].                    (TRIC 5)
+                            type(h') != type(h).                    (TRIC 5)
     swap_object_diff_type   (h, r, t) -> (h, r, t'),
-                            type[t'] != type[t].                    (TRIC 6)
+                            type(t') != type(t).                    (TRIC 6)
     add_spurious            Add a random non-existing triple.       (TRIC 9-10)
-
-Returns BOTH:
-  - the modified triple list (corrupted KG)
-  - a list of edit records: (clean_triple_or_None, corrupted_triple_or_None)
-    documenting each successful edit. Used by the dataset builder to construct
-    (clean, corrupted) training pairs without re-diffing.
 """
 from typing import Dict, List, Optional, Tuple
 
 import numpy as np
 
 
-Triple = Tuple[int, int, int]                          # (h_idx, r_idx, t_idx)
-EditRecord = Tuple[Optional[Triple], Optional[Triple]]  # (clean, corrupted)
+# A triple is just a 3-tuple of integer indices.
+# (head_index, relation_index, tail_index)
+Triple = Tuple[int, int, int]
+
+# An edit record documents one corruption step:
+#   (clean_triple_before_edit, corrupted_triple_after_edit)
+# For a "remove" op the second element is None (the triple is gone).
+# For an "add_spurious" op the first element is None (no clean triple to start with).
+# For substitutions (swap_*, change_relation) both are populated.
+EditRecord = Tuple[Optional[Triple], Optional[Triple]]
 
 
-_ALL_OPS = [
+# Names of every TRIC operation we support. Used as keys in op_weights.
+_ALL_OPERATIONS = [
     "remove",
     "swap_subject_same_type",
     "swap_object_same_type",
@@ -39,14 +58,18 @@ _ALL_OPS = [
     "add_spurious",
 ]
 
-_TYPE_OPS = {
+# Operations that need node-type information (the "same_type" / "diff_type" swaps).
+# These are silently dropped if the caller doesn't provide node_types.
+_TYPE_AWARE_OPERATIONS = {
     "swap_subject_same_type",
     "swap_object_same_type",
     "swap_subject_diff_type",
     "swap_object_diff_type",
 }
 
-_DEFAULT_WEIGHTS_WITH_TYPES = {
+# Default mixing weights when node_types are available.
+# Higher weight = operation gets picked more often.
+_DEFAULT_OPERATION_WEIGHTS_WITH_TYPES = {
     "remove":                  2,
     "swap_subject_same_type":  2,
     "swap_object_same_type":   2,
@@ -56,7 +79,8 @@ _DEFAULT_WEIGHTS_WITH_TYPES = {
     "add_spurious":            1,
 }
 
-_DEFAULT_WEIGHTS_NO_TYPES = {
+# Default mixing weights when node_types are NOT available.
+_DEFAULT_OPERATION_WEIGHTS_NO_TYPES = {
     "remove":          3,
     "change_relation": 2,
     "add_spurious":    1,
@@ -64,152 +88,241 @@ _DEFAULT_WEIGHTS_NO_TYPES = {
 
 
 def apply_tric_corruption(
-    triples: List[Triple],
-    num_corruptions: int,
-    rng: np.random.Generator,
+    clean_triples: List[Triple],
+    num_corruption_steps: int,
+    random_generator: np.random.Generator,
     *,
     num_entities: int,
     num_relations: int,
     node_types: Optional[Dict[int, str]] = None,
-    op_weights: Optional[Dict[str, float]] = None,
+    operation_weights: Optional[Dict[str, float]] = None,
 ) -> Tuple[List[Triple], List[EditRecord]]:
-    """Apply TRIC-style corruption to a triple list.
+    """Apply TRIC-style random corruption to a list of triples.
 
     Parameters
     ----------
-    triples         : list of (h_idx, r_idx, t_idx) tuples
-    num_corruptions : int  number of corruption steps to attempt
-    rng             : np.random.Generator
-    num_entities    : |E|  size of entity vocabulary
-    num_relations   : |R|  size of relation vocabulary
-    node_types      : optional dict[int, str]  entity_idx -> type
-                      Required for type-aware ops; those ops are silently
-                      dropped if node_types is None.
-    op_weights      : optional dict[op_name, float]  relative weights.
-                      Defaults depend on whether node_types is provided.
+    clean_triples
+        The starting KG, as a list of (head_index, relation_index, tail_index).
+        This list is NOT mutated; the function works on a copy.
+    num_corruption_steps
+        How many corruption operations to attempt. Some may be skipped if no
+        valid target exists (e.g. trying to change_relation on a triple whose
+        head and tail are already connected by every relation).
+    random_generator
+        numpy random Generator. Passing the same generator + same input gives
+        a deterministic result, which is essential for reproducibility.
+    num_entities, num_relations
+        Sizes of the entity and relation vocabularies. Used to sample
+        random replacement candidates for add_spurious and the swap ops.
+    node_types
+        Optional dict mapping entity_index -> type string (e.g. "Person",
+        "Country"). Required by the type-aware swap operations; those ops
+        are silently disabled if node_types is None.
+    operation_weights
+        Optional dict mapping operation name -> relative weight. If None,
+        uses _DEFAULT_OPERATION_WEIGHTS_WITH_TYPES or _DEFAULT_OPERATION_WEIGHTS_NO_TYPES.
+        Pass e.g. {"change_relation": 1} to enable ONLY change_relation.
 
     Returns
     -------
-    corrupted_triples : list of (h, r, t) tuples (the modified KG)
-    edit_records      : list of (clean, corrupted) edit records.
-                        For 'remove', corrupted is None.
-                        For 'add_spurious', clean is None.
-                        For swaps and change_relation, both are populated.
+    corrupted_triples : list[Triple]
+        The resulting KG after `num_corruption_steps` edits.
+    edit_records : list[EditRecord]
+        One record per *successful* edit. For pure adds the first element
+        is None; for pure removes the second element is None; otherwise
+        both are populated.
     """
-    if op_weights is None:
+    # ── Resolve the active operation distribution ──────────────────────────
+    if operation_weights is None:
         base_weights = (
-            _DEFAULT_WEIGHTS_WITH_TYPES if node_types is not None
-            else _DEFAULT_WEIGHTS_NO_TYPES
+            _DEFAULT_OPERATION_WEIGHTS_WITH_TYPES if node_types is not None
+            else _DEFAULT_OPERATION_WEIGHTS_NO_TYPES
         )
     else:
-        base_weights = {k: v for k, v in op_weights.items() if k in _ALL_OPS}
+        # Caller can pass arbitrary keys; ignore any not in our known list
+        base_weights = {
+            name: weight for name, weight in operation_weights.items()
+            if name in _ALL_OPERATIONS
+        }
 
+    # Drop type-aware operations if we don't have type information
     if node_types is None:
-        active_weights = {k: v for k, v in base_weights.items() if k not in _TYPE_OPS}
+        active_operation_weights = {
+            name: weight for name, weight in base_weights.items()
+            if name not in _TYPE_AWARE_OPERATIONS
+        }
     else:
-        active_weights = dict(base_weights)
+        active_operation_weights = dict(base_weights)
 
-    if not active_weights:
-        return list(triples), []
+    if not active_operation_weights:
+        return list(clean_triples), []
 
-    ops   = list(active_weights.keys())
-    probs = np.array([active_weights[o] for o in ops], dtype=float)
-    probs /= probs.sum()
+    operation_names = list(active_operation_weights.keys())
+    operation_probabilities = np.array(
+        [active_operation_weights[name] for name in operation_names],
+        dtype=float,
+    )
+    operation_probabilities /= operation_probabilities.sum()
 
-    # Working copy + fast existence-check set
-    result: List[Triple] = list(triples)
-    triple_set: set = set(result)
-    edits: List[EditRecord] = []
+    # ── Mutable working state ─────────────────────────────────────────────
+    # We maintain TWO data structures that mirror each other:
+    #   working_triples : the same triples in list form (preserves order,
+    #                     supports random-index access)
+    #   triple_set      : same triples in set form (gives O(1) "does this
+    #                     edge exist?" lookups, which we need many times
+    #                     when finding valid swap/change_relation targets)
+    working_triples: List[Triple] = list(clean_triples)
+    triple_set: set = set(working_triples)
+    edit_records: List[EditRecord] = []
 
-    def _pick_existing_idx() -> Optional[int]:
-        if not result:
+    def pick_existing_triple_index() -> Optional[int]:
+        """Pick a random index into `working_triples`, or None if empty."""
+        if not working_triples:
             return None
-        return int(rng.integers(len(result)))
+        return int(random_generator.integers(len(working_triples)))
 
-    for _ in range(num_corruptions):
-        op = ops[rng.choice(len(ops), p=probs)]
+    # ── Apply `num_corruption_steps` random edits ─────────────────────────
+    for _ in range(num_corruption_steps):
+        # Sample one operation per step from the weighted distribution
+        chosen_operation = operation_names[
+            random_generator.choice(len(operation_names), p=operation_probabilities)
+        ]
 
-        # ---- Pure delete ----
-        if op == "remove":
-            idx = _pick_existing_idx()
-            if idx is None:
+        # ─── Pure delete: remove an existing triple ─────────────────────
+        if chosen_operation == "remove":
+            triple_index = pick_existing_triple_index()
+            if triple_index is None:
                 continue
-            removed = result.pop(idx)
-            triple_set.discard(removed)
-            edits.append((removed, None))
+            removed_triple = working_triples.pop(triple_index)
+            triple_set.discard(removed_triple)
+            edit_records.append((removed_triple, None))
             continue
 
-        # ---- Pure add ----
-        if op == "add_spurious":
-            for _try in range(50):
-                h = int(rng.integers(num_entities))
-                t = int(rng.integers(num_entities))
-                r = int(rng.integers(num_relations))
-                if h != t and (h, r, t) not in triple_set:
-                    new_tri = (h, r, t)
-                    result.append(new_tri)
-                    triple_set.add(new_tri)
-                    edits.append((None, new_tri))
+        # ─── Pure add: invent a new triple that doesn't already exist ───
+        if chosen_operation == "add_spurious":
+            # Las Vegas style: keep sampling until we find a non-existing,
+            # non-self-loop triple. Cap at 50 attempts to avoid hangs in
+            # edge cases (very small entity/relation spaces).
+            for _ in range(50):
+                random_head_index     = int(random_generator.integers(num_entities))
+                random_tail_index     = int(random_generator.integers(num_entities))
+                random_relation_index = int(random_generator.integers(num_relations))
+                candidate_triple = (
+                    random_head_index, random_relation_index, random_tail_index,
+                )
+                # Reject self-loops and triples that already exist
+                if (random_head_index != random_tail_index
+                        and candidate_triple not in triple_set):
+                    working_triples.append(candidate_triple)
+                    triple_set.add(candidate_triple)
+                    edit_records.append((None, candidate_triple))
                     break
             continue
 
-        # ---- Substitution ops (need an existing triple) ----
-        idx = _pick_existing_idx()
-        if idx is None:
+        # ─── Substitution ops (swap or change_relation) ────────────────
+        # All of these pick an existing triple and replace ONE of its
+        # three components with a different valid one.
+        triple_index = pick_existing_triple_index()
+        if triple_index is None:
             continue
-        h, r, t = result[idx]
-        new_tri: Optional[Triple] = None
+        head_index, relation_index, tail_index = working_triples[triple_index]
+        new_triple: Optional[Triple] = None
 
-        if op == "change_relation":
-            cands = [r2 for r2 in range(num_relations)
-                     if r2 != r and (h, r2, t) not in triple_set]
-            if cands:
-                r2 = int(cands[rng.integers(len(cands))])
-                new_tri = (h, r2, t)
+        if chosen_operation == "change_relation":
+            # Find a relation r' != r such that (h, r', t) doesn't already exist.
+            valid_replacement_relations = [
+                alternative_relation
+                for alternative_relation in range(num_relations)
+                if alternative_relation != relation_index
+                and (head_index, alternative_relation, tail_index) not in triple_set
+            ]
+            if valid_replacement_relations:
+                chosen_new_relation_index = int(
+                    valid_replacement_relations[
+                        random_generator.integers(len(valid_replacement_relations))
+                    ]
+                )
+                new_triple = (head_index, chosen_new_relation_index, tail_index)
 
-        elif op == "swap_subject_same_type":
-            cands = [k for k in range(num_entities)
-                     if k != h and k != t
-                     and node_types.get(k) == node_types.get(h)
-                     and (k, r, t) not in triple_set]
-            if cands:
-                k = int(cands[rng.integers(len(cands))])
-                new_tri = (k, r, t)
+        elif chosen_operation == "swap_subject_same_type":
+            # Replace the head with another entity of the SAME type, such
+            # that the resulting (h', r, t) doesn't already exist.
+            valid_replacement_heads = [
+                candidate_head_index
+                for candidate_head_index in range(num_entities)
+                if candidate_head_index != head_index
+                and candidate_head_index != tail_index
+                and node_types.get(candidate_head_index) == node_types.get(head_index)
+                and (candidate_head_index, relation_index, tail_index) not in triple_set
+            ]
+            if valid_replacement_heads:
+                chosen_new_head_index = int(
+                    valid_replacement_heads[
+                        random_generator.integers(len(valid_replacement_heads))
+                    ]
+                )
+                new_triple = (chosen_new_head_index, relation_index, tail_index)
 
-        elif op == "swap_object_same_type":
-            cands = [k for k in range(num_entities)
-                     if k != t and k != h
-                     and node_types.get(k) == node_types.get(t)
-                     and (h, r, k) not in triple_set]
-            if cands:
-                k = int(cands[rng.integers(len(cands))])
-                new_tri = (h, r, k)
+        elif chosen_operation == "swap_object_same_type":
+            valid_replacement_tails = [
+                candidate_tail_index
+                for candidate_tail_index in range(num_entities)
+                if candidate_tail_index != tail_index
+                and candidate_tail_index != head_index
+                and node_types.get(candidate_tail_index) == node_types.get(tail_index)
+                and (head_index, relation_index, candidate_tail_index) not in triple_set
+            ]
+            if valid_replacement_tails:
+                chosen_new_tail_index = int(
+                    valid_replacement_tails[
+                        random_generator.integers(len(valid_replacement_tails))
+                    ]
+                )
+                new_triple = (head_index, relation_index, chosen_new_tail_index)
 
-        elif op == "swap_subject_diff_type":
-            cands = [k for k in range(num_entities)
-                     if k != h and k != t
-                     and node_types.get(k) != node_types.get(h)
-                     and (k, r, t) not in triple_set]
-            if cands:
-                k = int(cands[rng.integers(len(cands))])
-                new_tri = (k, r, t)
+        elif chosen_operation == "swap_subject_diff_type":
+            valid_replacement_heads = [
+                candidate_head_index
+                for candidate_head_index in range(num_entities)
+                if candidate_head_index != head_index
+                and candidate_head_index != tail_index
+                and node_types.get(candidate_head_index) != node_types.get(head_index)
+                and (candidate_head_index, relation_index, tail_index) not in triple_set
+            ]
+            if valid_replacement_heads:
+                chosen_new_head_index = int(
+                    valid_replacement_heads[
+                        random_generator.integers(len(valid_replacement_heads))
+                    ]
+                )
+                new_triple = (chosen_new_head_index, relation_index, tail_index)
 
-        elif op == "swap_object_diff_type":
-            cands = [k for k in range(num_entities)
-                     if k != t and k != h
-                     and node_types.get(k) != node_types.get(t)
-                     and (h, r, k) not in triple_set]
-            if cands:
-                k = int(cands[rng.integers(len(cands))])
-                new_tri = (h, r, k)
+        elif chosen_operation == "swap_object_diff_type":
+            valid_replacement_tails = [
+                candidate_tail_index
+                for candidate_tail_index in range(num_entities)
+                if candidate_tail_index != tail_index
+                and candidate_tail_index != head_index
+                and node_types.get(candidate_tail_index) != node_types.get(tail_index)
+                and (head_index, relation_index, candidate_tail_index) not in triple_set
+            ]
+            if valid_replacement_tails:
+                chosen_new_tail_index = int(
+                    valid_replacement_tails[
+                        random_generator.integers(len(valid_replacement_tails))
+                    ]
+                )
+                new_triple = (head_index, relation_index, chosen_new_tail_index)
 
-        if new_tri is None:
-            continue   # No valid target -> skip this step
+        # If no valid target existed for the chosen op (e.g. all relations
+        # already connect this head/tail pair), skip this step.
+        if new_triple is None:
+            continue
 
-        clean_tri = result[idx]
-        triple_set.discard(clean_tri)
-        triple_set.add(new_tri)
-        result[idx] = new_tri
-        edits.append((clean_tri, new_tri))
+        clean_triple = working_triples[triple_index]
+        triple_set.discard(clean_triple)
+        triple_set.add(new_triple)
+        working_triples[triple_index] = new_triple
+        edit_records.append((clean_triple, new_triple))
 
-    return result, edits
+    return working_triples, edit_records
