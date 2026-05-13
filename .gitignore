@@ -2,3 +2,6 @@
 .history
 *.ini
 __pycache__
+docs
+papers
+.claude

@@ -1,5 +1,5 @@
-"""Dataset builders for KG GAN training."""
+"""Dataset builders for KG GAN training (triple-level)."""
 
-from .kg_paired_dataset import build_kg_paired_dataset
+from .triple_pair_dataset import build_triple_pair_dataset
 
-__all__ = ["build_kg_paired_dataset"]
+__all__ = ["build_triple_pair_dataset"]
