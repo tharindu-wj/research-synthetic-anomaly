@@ -1,104 +1,101 @@
-"""TRIC-style triple corruption strategy for (N, N, R) adjacency tensors.
+"""TRIC-style triple corruption operating on a triple set (no adjacency tensor).
 
-Implements a subset of the TRIC operations (Senaratne et al., ESWC 2023,
-Table 1) adapted for the binary adjacency tensor representation:
+Implements a subset of the TRIC operations (Senaratne et al., ESWC 2023, Table 1):
 
-    A triple (s, p, o) maps to  adj[s, o, r] = 1
-    where r is the channel index for predicate p.
+    remove                  Delete a random existing triple.        (TRIC 1-4)
+    swap_subject_same_type  (h, r, t) -> (h', r, t),
+                            type[h'] == type[h].                    (TRIC 1)
+    swap_object_same_type   (h, r, t) -> (h, r, t'),
+                            type[t'] == type[t].                    (TRIC 2)
+    change_relation         (h, r, t) -> (h, r', t).                (TRIC 3)
+    swap_subject_diff_type  (h, r, t) -> (h', r, t),
+                            type[h'] != type[h].                    (TRIC 5)
+    swap_object_diff_type   (h, r, t) -> (h, r, t'),
+                            type[t'] != type[t].                    (TRIC 6)
+    add_spurious            Add a random non-existing triple.       (TRIC 9-10)
 
-Supported operations
---------------------
-remove                  Delete a random existing edge.            (TRIC types 1-4)
-swap_subject_same_type  Move edge (i→j, r) to (k→j, r)
-                        where type[k] == type[i].                 (TRIC type 1)
-swap_object_same_type   Move edge (i→j, r) to (i→k, r)
-                        where type[k] == type[j].                 (TRIC type 2)
-change_relation         Move edge (i,j,r) to (i,j,r').            (TRIC type 3)
-swap_subject_diff_type  Move edge (i→j, r) to (k→j, r)
-                        where type[k] != type[i].                 (TRIC type 5)
-swap_object_diff_type   Move edge (i→j, r) to (i→k, r)
-                        where type[k] != type[j].                 (TRIC type 6)
-add_spurious            Add a random non-existing off-diagonal
-                        edge (type-agnostic).                     (TRIC types 9-10)
-
-Literal-based TRIC types (11-15) are not applicable — this KG has no
-attribute literals in the adjacency tensor.
+Returns BOTH:
+  - the modified triple list (corrupted KG)
+  - a list of edit records: (clean_triple_or_None, corrupted_triple_or_None)
+    documenting each successful edit. Used by the dataset builder to construct
+    (clean, corrupted) training pairs without re-diffing.
 """
+from typing import Dict, List, Optional, Tuple
+
 import numpy as np
-from typing import Optional
+
+
+Triple = Tuple[int, int, int]                          # (h_idx, r_idx, t_idx)
+EditRecord = Tuple[Optional[Triple], Optional[Triple]]  # (clean, corrupted)
 
 
 _ALL_OPS = [
-    'remove',
-    'swap_subject_same_type',
-    'swap_object_same_type',
-    'change_relation',
-    'swap_subject_diff_type',
-    'swap_object_diff_type',
-    'add_spurious',
+    "remove",
+    "swap_subject_same_type",
+    "swap_object_same_type",
+    "change_relation",
+    "swap_subject_diff_type",
+    "swap_object_diff_type",
+    "add_spurious",
 ]
 
 _TYPE_OPS = {
-    'swap_subject_same_type',
-    'swap_object_same_type',
-    'swap_subject_diff_type',
-    'swap_object_diff_type',
+    "swap_subject_same_type",
+    "swap_object_same_type",
+    "swap_subject_diff_type",
+    "swap_object_diff_type",
 }
 
 _DEFAULT_WEIGHTS_WITH_TYPES = {
-    'remove':                  2,
-    'swap_subject_same_type':  2,
-    'swap_object_same_type':   2,
-    'change_relation':         1,
-    'swap_subject_diff_type':  1,
-    'swap_object_diff_type':   1,
-    'add_spurious':            1,
+    "remove":                  2,
+    "swap_subject_same_type":  2,
+    "swap_object_same_type":   2,
+    "change_relation":         1,
+    "swap_subject_diff_type":  1,
+    "swap_object_diff_type":   1,
+    "add_spurious":            1,
 }
 
 _DEFAULT_WEIGHTS_NO_TYPES = {
-    'remove':          3,
-    'change_relation': 2,
-    'add_spurious':    1,
+    "remove":          3,
+    "change_relation": 2,
+    "add_spurious":    1,
 }
 
 
 def apply_tric_corruption(
-    adj_nxnxr: np.ndarray,
+    triples: List[Triple],
     num_corruptions: int,
     rng: np.random.Generator,
-    node_types: Optional[dict] = None,
-    op_weights: Optional[dict] = None,
-) -> np.ndarray:
-    """Apply TRIC-style triple corruption to a (N, N, R) adjacency tensor.
-
-    Each corruption step:
-      1. Randomly selects one operation from the weighted distribution.
-      2. Picks a random existing edge (or non-edge for add_spurious).
-      3. Applies the transformation in-place on the working copy.
-      4. Skips gracefully if no valid target exists for the chosen op
-         (e.g. no same-type swap partner available).
+    *,
+    num_entities: int,
+    num_relations: int,
+    node_types: Optional[Dict[int, str]] = None,
+    op_weights: Optional[Dict[str, float]] = None,
+) -> Tuple[List[Triple], List[EditRecord]]:
+    """Apply TRIC-style corruption to a triple list.
 
     Parameters
     ----------
-    adj_nxnxr      : np.ndarray, shape (N, N, R), float32
-    num_corruptions: int — number of corruption steps to attempt
-    rng            : np.random.Generator
-    node_types     : dict[int, str] or None
-                     row_index → entity type string (e.g. 'Person', 'Country').
-                     Required for type-aware ops; those ops are silently dropped
-                     from the distribution when node_types is None.
-    op_weights     : dict[str, float] or None
-                     Maps operation name → relative weight. Unrecognised keys are
-                     ignored. If None, uses the built-in defaults.
+    triples         : list of (h_idx, r_idx, t_idx) tuples
+    num_corruptions : int  number of corruption steps to attempt
+    rng             : np.random.Generator
+    num_entities    : |E|  size of entity vocabulary
+    num_relations   : |R|  size of relation vocabulary
+    node_types      : optional dict[int, str]  entity_idx -> type
+                      Required for type-aware ops; those ops are silently
+                      dropped if node_types is None.
+    op_weights      : optional dict[op_name, float]  relative weights.
+                      Defaults depend on whether node_types is provided.
 
     Returns
     -------
-    np.ndarray — corrupted copy, same shape as input
+    corrupted_triples : list of (h, r, t) tuples (the modified KG)
+    edit_records      : list of (clean, corrupted) edit records.
+                        For 'remove', corrupted is None.
+                        For 'add_spurious', clean is None.
+                        For swaps and change_relation, both are populated.
     """
-    corrupted = adj_nxnxr.copy()
-    N, _, R = corrupted.shape
-
-    # ── Resolve operation distribution ───────────────────────────────────────
     if op_weights is None:
         base_weights = (
             _DEFAULT_WEIGHTS_WITH_TYPES if node_types is not None
@@ -107,126 +104,112 @@ def apply_tric_corruption(
     else:
         base_weights = {k: v for k, v in op_weights.items() if k in _ALL_OPS}
 
-    # Drop type-aware ops when node_types is unavailable
     if node_types is None:
         active_weights = {k: v for k, v in base_weights.items() if k not in _TYPE_OPS}
     else:
         active_weights = dict(base_weights)
 
     if not active_weights:
-        return corrupted
+        return list(triples), []
 
     ops   = list(active_weights.keys())
     probs = np.array([active_weights[o] for o in ops], dtype=float)
     probs /= probs.sum()
 
-    # ── Helper: current edge and non-edge lists ───────────────────────────────
-    def _edges():
-        ii, jj, rr = np.where(corrupted > 0.5)
-        mask = ii != jj   # exclude diagonal (no self-loops)
-        return list(zip(ii[mask], jj[mask], rr[mask]))
+    # Working copy + fast existence-check set
+    result: List[Triple] = list(triples)
+    triple_set: set = set(result)
+    edits: List[EditRecord] = []
 
-    def _non_edges():
-        ii, jj, rr = np.where(corrupted < 0.5)
-        mask = ii != jj   # exclude diagonal
-        return list(zip(ii[mask], jj[mask], rr[mask]))
+    def _pick_existing_idx() -> Optional[int]:
+        if not result:
+            return None
+        return int(rng.integers(len(result)))
 
-    # ── Apply corruption steps ────────────────────────────────────────────────
     for _ in range(num_corruptions):
         op = ops[rng.choice(len(ops), p=probs)]
 
-        if op == 'remove':
-            edge_list = _edges()
-            if not edge_list:
+        # ---- Pure delete ----
+        if op == "remove":
+            idx = _pick_existing_idx()
+            if idx is None:
                 continue
-            i, j, r = edge_list[rng.integers(len(edge_list))]
-            corrupted[i, j, r] = 0.0
+            removed = result.pop(idx)
+            triple_set.discard(removed)
+            edits.append((removed, None))
+            continue
 
-        elif op == 'add_spurious':
-            non_edge_list = _non_edges()
-            if not non_edge_list:
-                continue
-            i, j, r = non_edge_list[rng.integers(len(non_edge_list))]
-            corrupted[i, j, r] = 1.0
+        # ---- Pure add ----
+        if op == "add_spurious":
+            for _try in range(50):
+                h = int(rng.integers(num_entities))
+                t = int(rng.integers(num_entities))
+                r = int(rng.integers(num_relations))
+                if h != t and (h, r, t) not in triple_set:
+                    new_tri = (h, r, t)
+                    result.append(new_tri)
+                    triple_set.add(new_tri)
+                    edits.append((None, new_tri))
+                    break
+            continue
 
-        elif op == 'change_relation':
-            edge_list = _edges()
-            if not edge_list:
-                continue
-            i, j, r = edge_list[rng.integers(len(edge_list))]
-            other_relations = [r2 for r2 in range(R) if r2 != r and corrupted[i, j, r2] < 0.5]
-            if not other_relations:
-                continue
-            r2 = other_relations[rng.integers(len(other_relations))]
-            corrupted[i, j, r]  = 0.0
-            corrupted[i, j, r2] = 1.0
+        # ---- Substitution ops (need an existing triple) ----
+        idx = _pick_existing_idx()
+        if idx is None:
+            continue
+        h, r, t = result[idx]
+        new_tri: Optional[Triple] = None
 
-        elif op == 'swap_subject_same_type':
-            edge_list = _edges()
-            if not edge_list:
-                continue
-            i, j, r = edge_list[rng.integers(len(edge_list))]
-            candidates = [
-                k for k in range(N)
-                if k != i and k != j
-                and node_types.get(k) == node_types.get(i)
-                and corrupted[k, j, r] < 0.5
-            ]
-            if not candidates:
-                continue
-            k = candidates[rng.integers(len(candidates))]
-            corrupted[i, j, r] = 0.0
-            corrupted[k, j, r] = 1.0
+        if op == "change_relation":
+            cands = [r2 for r2 in range(num_relations)
+                     if r2 != r and (h, r2, t) not in triple_set]
+            if cands:
+                r2 = int(cands[rng.integers(len(cands))])
+                new_tri = (h, r2, t)
 
-        elif op == 'swap_object_same_type':
-            edge_list = _edges()
-            if not edge_list:
-                continue
-            i, j, r = edge_list[rng.integers(len(edge_list))]
-            candidates = [
-                k for k in range(N)
-                if k != j and k != i
-                and node_types.get(k) == node_types.get(j)
-                and corrupted[i, k, r] < 0.5
-            ]
-            if not candidates:
-                continue
-            k = candidates[rng.integers(len(candidates))]
-            corrupted[i, j, r] = 0.0
-            corrupted[i, k, r] = 1.0
+        elif op == "swap_subject_same_type":
+            cands = [k for k in range(num_entities)
+                     if k != h and k != t
+                     and node_types.get(k) == node_types.get(h)
+                     and (k, r, t) not in triple_set]
+            if cands:
+                k = int(cands[rng.integers(len(cands))])
+                new_tri = (k, r, t)
 
-        elif op == 'swap_subject_diff_type':
-            edge_list = _edges()
-            if not edge_list:
-                continue
-            i, j, r = edge_list[rng.integers(len(edge_list))]
-            candidates = [
-                k for k in range(N)
-                if k != i and k != j
-                and node_types.get(k) != node_types.get(i)
-                and corrupted[k, j, r] < 0.5
-            ]
-            if not candidates:
-                continue
-            k = candidates[rng.integers(len(candidates))]
-            corrupted[i, j, r] = 0.0
-            corrupted[k, j, r] = 1.0
+        elif op == "swap_object_same_type":
+            cands = [k for k in range(num_entities)
+                     if k != t and k != h
+                     and node_types.get(k) == node_types.get(t)
+                     and (h, r, k) not in triple_set]
+            if cands:
+                k = int(cands[rng.integers(len(cands))])
+                new_tri = (h, r, k)
 
-        elif op == 'swap_object_diff_type':
-            edge_list = _edges()
-            if not edge_list:
-                continue
-            i, j, r = edge_list[rng.integers(len(edge_list))]
-            candidates = [
-                k for k in range(N)
-                if k != j and k != i
-                and node_types.get(k) != node_types.get(j)
-                and corrupted[i, k, r] < 0.5
-            ]
-            if not candidates:
-                continue
-            k = candidates[rng.integers(len(candidates))]
-            corrupted[i, j, r] = 0.0
-            corrupted[i, k, r] = 1.0
+        elif op == "swap_subject_diff_type":
+            cands = [k for k in range(num_entities)
+                     if k != h and k != t
+                     and node_types.get(k) != node_types.get(h)
+                     and (k, r, t) not in triple_set]
+            if cands:
+                k = int(cands[rng.integers(len(cands))])
+                new_tri = (k, r, t)
 
-    return corrupted
+        elif op == "swap_object_diff_type":
+            cands = [k for k in range(num_entities)
+                     if k != t and k != h
+                     and node_types.get(k) != node_types.get(t)
+                     and (h, r, k) not in triple_set]
+            if cands:
+                k = int(cands[rng.integers(len(cands))])
+                new_tri = (h, r, k)
+
+        if new_tri is None:
+            continue   # No valid target -> skip this step
+
+        clean_tri = result[idx]
+        triple_set.discard(clean_tri)
+        triple_set.add(new_tri)
+        result[idx] = new_tri
+        edits.append((clean_tri, new_tri))
+
+    return result, edits

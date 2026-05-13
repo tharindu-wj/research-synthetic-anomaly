@@ -1,0 +1,10 @@
+/dummy/Alice	Alice	Person
+/dummy/Bob	Bob	Person
+/dummy/Carol	Carol	Person
+/dummy/Dave	Dave	Person
+/dummy/Eve	Eve	Person
+/dummy/Frank	Frank	Person
+/dummy/Australia	Australia	Country
+/dummy/Japan	Japan	Country
+/dummy/Brazil	Brazil	Country
+/dummy/France	France	Country
