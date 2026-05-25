@@ -27,8 +27,6 @@ Usage - run with the PROJECT's interpreter, not the Windows Store python stub::
 Exit code is non-zero if any cell raised.
 """
 
-from __future__ import annotations
-
 import argparse
 import io
 import json
@@ -109,7 +107,7 @@ def _rewrite_line(line: str, install: bool):
 def preprocess_source(source: str, install: bool):
     """Strip/translate magics in a code cell. Returns (clean_source, notes)."""
     lines = source.splitlines()
-    notes: list[str] = []
+    notes = []
 
     # Cell magic (%%foo) only matters as the first non-blank line.
     first_idx = next((i for i, ln in enumerate(lines) if ln.strip()), None)
