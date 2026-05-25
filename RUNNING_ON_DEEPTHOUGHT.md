@@ -82,18 +82,34 @@ ls ~/scratch/kg_runs/<jobid>/                 # figure_01..05.png + run.log
 | `ModuleNotFoundError` for torch/numpy/... | The env wasn't built or wasn't activated — redo step 1; confirm `CONDA_ENV` path. |
 | Pending forever | Cluster busy; lower `--time` (better backfill) or wait. Check with `squeue -u $USER --start`. |
 
-## Scaling up to GPU later
+## Running on GPU (Tesla V100)
 
-The notebook already selects CUDA automatically via
-`torch.cuda.is_available()`. To run on a Tesla V100:
+Use the dedicated [`slurm/run_pipeline_gpu.slurm`](slurm/run_pipeline_gpu.slurm)
+— it adds `--partition=gpu --gres=gpu:tesla_v100:1` and a pre-flight check that
+fails fast if torch can't see the GPU. The notebook auto-selects CUDA via
+`torch.cuda.is_available()`, so no notebook change is needed.
 
-1. In `slurm/run_pipeline.slurm` add:
-   ```bash
-   #SBATCH --partition=gpu
-   #SBATCH --gres=gpu:tesla_v100:1
-   ```
-   and load a CUDA module (`module load cuda<XX.X>/toolkit`).
-2. Reinstall torch with a matching CUDA wheel (e.g. `--index-url .../whl/cu121`).
+**The env's torch must be a CUDA build** — the CPU wheel installed above will run
+on CPU even when a GPU is allocated. Match the wheel to the GPU node's driver:
+
+```bash
+# 1. Check the GPU node's max CUDA version (note "CUDA Version: XX.X" top-right):
+srun --partition=gpu --gres=gpu:tesla_v100:1 --time=00:05:00 --pty nvidia-smi
+
+# 2. Reinstall torch with the matching wheel (login node):
+conda activate $HOME/envs/kggan
+python -m pip uninstall -y torch
+#   driver shows CUDA >= 12.1  -> cu121 ;  CUDA 11.x -> cu118
+python -m pip install torch --index-url https://download.pytorch.org/whl/cu121
+python -c "import torch; print('torch', torch.__version__, '| cuda build', torch.version.cuda)"
+
+# 3. Submit:
+sbatch slurm/run_pipeline_gpu.slurm
+```
+
+Confirm it actually used the GPU: the log should print `GPU: Tesla V100-...` and
+the notebook's `Using device: cuda`.
 
 Note: only 5 V100s exist cluster-wide and GPUs carry a heavy Fairshare weight, so
-expect longer queues — worth it only when the model/dataset grows (e.g. FB15k-237).
+expect longer queues. For this PoC the model is tiny, so GPU may not beat CPU —
+the real payoff comes when the model/dataset grows (e.g. FB15k-237).
