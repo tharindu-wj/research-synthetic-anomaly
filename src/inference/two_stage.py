@@ -16,6 +16,8 @@ generator in a two-stage process:
 Running the whole pipeline K times with different randomness yields K
 distinct corrupted versions of the same clean KG.
 """
+from __future__ import annotations
+
 from typing import List, Sequence, Tuple
 
 import numpy as np

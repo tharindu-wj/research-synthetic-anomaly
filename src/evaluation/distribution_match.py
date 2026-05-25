@@ -16,6 +16,8 @@ and compare three things:
 Both the rule baseline and the GAN are run on triple lists. Set differences
 replace adjacency diffs.
 """
+from __future__ import annotations
+
 from typing import Callable, Dict, Sequence, Tuple
 
 import numpy as np

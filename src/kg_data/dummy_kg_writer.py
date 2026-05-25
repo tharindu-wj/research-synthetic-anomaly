@@ -14,6 +14,8 @@ All entity ids and relation ids carry a "/dummy/" prefix to keep them visually
 distinct from FB15k-237's "/m/..." ids, while still being valid Freebase-style
 strings.
 """
+from __future__ import annotations
+
 from pathlib import Path
 from typing import Iterable
 
