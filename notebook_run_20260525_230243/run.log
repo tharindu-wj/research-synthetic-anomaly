@@ -1,0 +1,963 @@
+Notebook : D:\Tharindu\Flinders\2025_2_ML\notebooks\research_synthetic_anomaly\src\knowledge_graph_clone.ipynb
+Workdir  : D:\Tharindu\Flinders\2025_2_ML\notebooks\research_synthetic_anomaly\src
+Python   : C:\Users\thari\miniconda3\python.exe
+Outdir   : D:\Tharindu\Flinders\2025_2_ML\notebooks\research_synthetic_anomaly\notebook_run_20260525_230243
+Started  : 2026-05-25 23:02:46  (15 code cells)
+
+========================================================================
+CELL 1/15  (notebook index 3)
+========================================================================
+--- source -------------------------------------------------------------
+# from google.colab import drive
+import os, sys
+from pathlib import Path
+
+# drive.mount('/content/drive')
+
+# project_path = "/content/drive/MyDrive/Flinders_NN/research_synthetic_anomaly"
+# project_path = "/content/drive/Othercomputers/My laptop/research_synthetic_anomaly"
+project_path = Path.cwd()
+
+os.chdir(project_path)
+if project_path not in sys.path:
+    sys.path.insert(0, project_path)
+print('Working directory:', os.getcwd())
+--- output -------------------------------------------------------------
+Working directory: D:\Tharindu\Flinders\2025_2_ML\notebooks\research_synthetic_anomaly\src
+[runner] OK in 0.00s
+
+========================================================================
+CELL 2/15  (notebook index 4)
+========================================================================
+[runner] skipped pip: %pip install torchinfo torch_geometric
+--- source -------------------------------------------------------------
+%pip install torchinfo torch_geometric
+
+import numpy as np
+import torch
+import torch.nn as nn
+import torch.optim as optim
+import torch.utils.data as data_utils
+import matplotlib.pyplot as plt
+
+# Seeding: pinning all random sources makes runs reproducible.
+random_seed = 42
+np.random.seed(random_seed)
+torch.manual_seed(random_seed)
+
+# Use the GPU if Colab gave us one; otherwise fall back to CPU.
+compute_device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
+print(f'Using device: {compute_device}')
+print(f'torch version: {torch.__version__}')
+--- output -------------------------------------------------------------
+Using device: cpu
+torch version: 2.8.0+cpu
+[runner] OK in 2.26s
+
+========================================================================
+CELL 3/15  (notebook index 6)
+========================================================================
+--- source -------------------------------------------------------------
+from kg_data import load_kg
+
+knowledge_graph = load_kg('datasets/dummy_kg')
+
+print(f"Dataset:    {knowledge_graph.dataset_name}")
+print(f"Entities:   {knowledge_graph.num_nodes}")
+print(f"Relations:  {knowledge_graph.num_relations}")
+print(f"Triples:    {len(knowledge_graph.triples_idx)} (train), "
+      f"{len(knowledge_graph.valid_triples)} (valid), "
+      f"{len(knowledge_graph.test_triples)} (test)")
+
+# Short aliases used throughout this notebook. The shapes mentioned below
+# refer to the dummy KG: 10 entities, 3 relations, 18 triples.
+num_entities          = knowledge_graph.num_nodes        # 10
+num_relations         = knowledge_graph.num_relations    # 3
+node_labels           = knowledge_graph.node_labels      # {row_index: "Alice", ...}
+node_types            = knowledge_graph.node_types       # {row_index: "Person", ...}
+relation_names        = knowledge_graph.relation_names   # ["born_in", ...]
+
+# Triples in integer-indexed form: list of (head_index, relation_index, tail_index).
+# This is the form downstream code (TRIC, dataset builder, model) consumes.
+clean_triples_in_kg   = list(knowledge_graph.triples_idx)
+
+print()
+print("First 3 triples in (head_index, relation_index, tail_index) form:")
+for head_index, relation_index, tail_index in clean_triples_in_kg[:3]:
+    print(f"  ({head_index:2d}, {relation_index}, {tail_index:2d})  =>  "
+          f"{node_labels[head_index]} --{relation_names[relation_index]}--> "
+          f"{node_labels[tail_index]}")
+--- output -------------------------------------------------------------
+Dataset:    dummy_kg
+Entities:   10
+Relations:  3
+Triples:    18 (train), 0 (valid), 0 (test)
+
+First 3 triples in (head_index, relation_index, tail_index) form:
+  ( 0, 0,  1)  =>  Alice --born_in--> Australia
+  ( 2, 0,  1)  =>  Bob --born_in--> Australia
+  ( 3, 0,  4)  =>  Carol --born_in--> Japan
+[runner] OK in 0.00s
+
+========================================================================
+CELL 4/15  (notebook index 8)
+========================================================================
+--- source -------------------------------------------------------------
+from visualisation import visualise_kg
+from kg_data import triples_to_adjacency_tensor
+
+# Build the adjacency tensor on the fly. For the dummy KG it's tiny; for
+# FB15k-237 we'd visualise a subgraph instead because the full tensor is
+# ~199 GB at that scale.
+adjacency_tensor_for_plot = triples_to_adjacency_tensor(
+    knowledge_graph.triples,
+    knowledge_graph.entity_id_to_row,
+    knowledge_graph.relation_id_to_channel,
+)
+
+visualise_kg(
+    adjacency_tensor_for_plot,
+    node_labels, node_types, relation_names,
+    title=f"Knowledge Graph: {knowledge_graph.dataset_name}",
+    figsize=(7, 5),
+)
+--- output -------------------------------------------------------------
+[runner] saved figure -> D:\Tharindu\Flinders\2025_2_ML\notebooks\research_synthetic_anomaly\notebook_run_20260525_230243\figure_01.png
+[runner] OK in 0.69s
+
+========================================================================
+CELL 5/15  (notebook index 10)
+========================================================================
+--- source -------------------------------------------------------------
+import functools
+from corruption_strategies import apply_tric_corruption
+from dataset_builders import build_triple_pair_dataset
+
+# Hyperparameters for the training-data builder.
+num_corruption_steps_per_round = 2     # TRIC applies this many edits per round
+num_training_rounds            = 4000  # repeats with different permutations
+training_batch_size            = 64    # how many pairs per gradient step
+
+# Pre-bind TRIC's kwargs using functools.partial. The result is a callable
+# that takes (triples, num_corruption_steps, rng) — the signature
+# build_triple_pair_dataset expects in its `corruption_fn`.
+tric_corruption_fn = functools.partial(
+    apply_tric_corruption,
+    num_entities=num_entities,
+    num_relations=num_relations,
+    node_types=node_types,
+    operation_weights={'change_relation': 1},   # change_relation ONLY
+)
+
+# Build the (M, 6) tensor. M ≈ 7,640 for default settings on the dummy KG
+# (some rounds skip ops when no valid target exists).
+training_pair_random_generator = np.random.default_rng(random_seed)
+triple_pair_tensor = build_triple_pair_dataset(
+    clean_triples_in_kg,
+    num_rounds=num_training_rounds,
+    num_corruption_steps_per_round=num_corruption_steps_per_round,
+    random_generator=training_pair_random_generator,
+    num_entities=num_entities,
+    num_relations=num_relations,
+    corruption_fn=tric_corruption_fn,
+    permute_entities=True,
+)
+
+# Split the (M, 6) tensor into two (M, 3) halves — DataLoader-friendly.
+training_clean_triples  = triple_pair_tensor[:, :3]
+training_target_triples = triple_pair_tensor[:, 3:]
+
+print(f"Training rounds:      {num_training_rounds}")
+print(f"Triple pairs built:   {len(triple_pair_tensor)}  "
+      f"(avg {len(triple_pair_tensor) / max(num_training_rounds, 1):.2f} per round; "
+      f"expected ~{num_corruption_steps_per_round})")
+
+# Sanity check: for pure change_relation, every pair must preserve h and t
+# and change r.
+triple_pair_numpy = triple_pair_tensor.numpy()
+if len(triple_pair_numpy) > 0:
+    head_match_fraction     = (triple_pair_numpy[:, 0] == triple_pair_numpy[:, 3]).mean()
+    tail_match_fraction     = (triple_pair_numpy[:, 2] == triple_pair_numpy[:, 5]).mean()
+    relation_differ_fraction = (triple_pair_numpy[:, 1] != triple_pair_numpy[:, 4]).mean()
+    print(f"change_relation sanity: "
+          f"same_h={head_match_fraction:.3f}, "
+          f"same_t={tail_match_fraction:.3f}, "
+          f"diff_r={relation_differ_fraction:.3f}  "
+          f"(all should be 1.0)")
+
+# Wrap in a DataLoader (PyTorch's "yield batches" helper).
+triple_pair_torch_dataset = data_utils.TensorDataset(
+    training_clean_triples, training_target_triples,
+)
+triple_pair_dataloader = data_utils.DataLoader(
+    triple_pair_torch_dataset,
+    batch_size=training_batch_size,
+    shuffle=True, drop_last=True,
+)
+print(f"DataLoader:  {len(triple_pair_torch_dataset)} pairs, "
+      f"{len(triple_pair_dataloader)} batches/epoch")
+--- output -------------------------------------------------------------
+Training rounds:      4000
+Triple pairs built:   8000  (avg 2.00 per round; expected ~2)
+change_relation sanity: same_h=1.000, same_t=1.000, diff_r=1.000  (all should be 1.0)
+DataLoader:  8000 pairs, 125 batches/epoch
+[runner] OK in 0.31s
+
+========================================================================
+CELL 6/15  (notebook index 12)
+========================================================================
+--- source -------------------------------------------------------------
+from visualisation import plot_dataset_sample
+
+# Pick one training pair to visualise.
+example_pair_index    = 0
+clean_triple_tuple    = tuple(triple_pair_tensor[example_pair_index, :3].tolist())
+target_triple_tuple   = tuple(triple_pair_tensor[example_pair_index, 3:].tolist())
+
+
+def build_adjacency_from_index_triples(index_triples, num_entities, num_relations):
+    """Tiny helper: convert a list of (h, r, t) integer triples to an (N, N, R)
+    adjacency tensor. We use this ONLY for plotting."""
+    adjacency = np.zeros((num_entities, num_entities, num_relations), dtype=np.float32)
+    for head_index, relation_index, tail_index in index_triples:
+        if head_index != tail_index:
+            adjacency[head_index, tail_index, relation_index] = 1.0
+    return adjacency
+
+
+# Clean view = the full KG. Corrupted view = the full KG with the one edit applied.
+clean_kg_view     = list(knowledge_graph.triples_idx)
+corrupted_kg_view = (
+    [triple for triple in knowledge_graph.triples_idx if triple != clean_triple_tuple]
+    + [target_triple_tuple]
+)
+
+clean_adjacency_for_plot     = build_adjacency_from_index_triples(
+    clean_kg_view,     num_entities, num_relations,
+)
+corrupted_adjacency_for_plot = build_adjacency_from_index_triples(
+    corrupted_kg_view, num_entities, num_relations,
+)
+
+plot_dataset_sample(
+    clean_adjacency_for_plot,
+    corrupted_adjacency_for_plot,
+    node_labels, node_types, relation_names,
+    num_corruptions=1,    # we visualise one substitution
+)
+
+clean_head, clean_relation, clean_tail   = clean_triple_tuple
+target_head, target_relation, target_tail = target_triple_tuple
+print(
+    f"Substitution: "
+    f"({node_labels[clean_head]}, {relation_names[clean_relation]}, {node_labels[clean_tail]})"
+    f"  =>  "
+    f"({node_labels[target_head]}, {relation_names[target_relation]}, {node_labels[target_tail]})"
+)
+--- output -------------------------------------------------------------
+[runner] saved figure -> D:\Tharindu\Flinders\2025_2_ML\notebooks\research_synthetic_anomaly\notebook_run_20260525_230243\figure_02.png
+Substitution: (Dave, lives_in, Brazil)  =>  (Dave, married_to, Brazil)
+[runner] OK in 0.82s
+
+========================================================================
+CELL 7/15  (notebook index 14)
+========================================================================
+--- source -------------------------------------------------------------
+# ─── Architecture hyperparameters ────────────────────────────────────────
+embedding_dim            = 100   # d in Dai 2020: dim of every entity/relation embedding
+latent_dim               = 8     # d_z: dim of the per-forward random noise vector
+encoder_base_channels    = 32    # initial conv channel count (doubles each layer)
+encoder_num_conv_layers  = 3     # number of 1x1 conv layers in the encoder
+encoder_num_attn_heads   = 4     # multi-head attention: number of parallel heads
+bottleneck_hidden_dim    = 128   # hidden_state dim at the bottleneck
+gumbel_temperature_start = 1.0   # start of training (softer, more random)
+gumbel_temperature_end   = 0.5   # end of warm phase (sharper, near-argmax)
+leaky_relu_negative_slope = 0.2
+
+
+class EntityEmbedding(nn.Module):
+    """Learnable lookup table: row i is the embedding vector for entity i.
+
+    This is `nn.Embedding` with custom init. The weights are TRAINABLE — they
+    learn during the G-step of GAN training (the entity embeddings are part
+    of the generator's parameter list).
+    """
+    def __init__(self, num_entities, embedding_dim):
+        super().__init__()
+        self.embedding_table = nn.Embedding(num_entities, embedding_dim)
+        # Initialise with small Gaussian noise (standard practice for embeddings).
+        nn.init.normal_(self.embedding_table.weight, mean=0.0, std=1.0 / (embedding_dim ** 0.5))
+
+    def forward(self, entity_indices):
+        # `entity_indices` is a long tensor of shape (...,). Output: (..., embedding_dim).
+        return self.embedding_table(entity_indices)
+
+    def lookup_weight(self):
+        # Direct access to the full (num_entities, embedding_dim) weight matrix.
+        # Used by re_embed_soft_samples to multiply a soft sample by the table.
+        return self.embedding_table.weight
+
+
+class RelationEmbedding(nn.Module):
+    """Same shape as EntityEmbedding but for relations (much smaller vocabulary)."""
+    def __init__(self, num_relations, embedding_dim):
+        super().__init__()
+        self.embedding_table = nn.Embedding(num_relations, embedding_dim)
+        nn.init.normal_(self.embedding_table.weight, mean=0.0, std=1.0 / (embedding_dim ** 0.5))
+
+    def forward(self, relation_indices):
+        return self.embedding_table(relation_indices)
+
+    def lookup_weight(self):
+        return self.embedding_table.weight
+
+
+def gumbel_softmax_sample(logits, gumbel_temperature=1.0, epsilon=1e-10):
+    """Differentiable sample from a categorical distribution (Jang 2017, Dai 2024).
+
+    Normally to "pick" a class from logits we'd use argmax. But argmax has
+    no gradient — we couldn't train through it. Gumbel-Softmax replaces
+    argmax with a near-one-hot soft sample that IS differentiable:
+
+      1. Add iid Gumbel noise to the logits (introduces sampling).
+      2. Divide by temperature `gumbel_temperature` (small => sharp,
+         large => uniform).
+      3. Apply softmax.
+
+    At low temperatures the soft sample is almost argmax; at high
+    temperatures it's almost uniform. We anneal from 1.0 to 0.5 during
+    training.
+    """
+    # Sample uniform noise, clamp to keep log() finite.
+    uniform_noise = torch.rand_like(logits).clamp_(epsilon, 1.0 - epsilon)
+    # Inverse-CDF trick: uniform -> Gumbel-distributed noise.
+    gumbel_noise = -torch.log(-torch.log(uniform_noise))
+    # Apply temperature and softmax.
+    perturbed_logits = (logits + gumbel_noise) / gumbel_temperature
+    return torch.softmax(perturbed_logits, dim=-1)
+
+
+class TripleGenerator(nn.Module):
+    """The generator: maps a clean triple (and a random latent) to logits over
+    the three triple positions (head entity, relation, tail entity).
+
+    Architecture (left to right):
+        clean_triple_embedding (B, 3, d)
+          -> encoder: 1x1 Conv2d stack + multi-head self-attention
+          -> bottleneck: concat with latent z, project to hidden state
+          -> three independent MLPs producing logits over E / R / E vocabs
+          -> optional Gumbel-Softmax for differentiable sampling
+    """
+    def __init__(
+        self, num_entities, num_relations,
+        embedding_dim, latent_dim,
+        encoder_base_channels=32, encoder_num_conv_layers=3,
+        encoder_num_attn_heads=4, bottleneck_hidden_dim=128,
+    ):
+        super().__init__()
+        self.num_entities  = num_entities
+        self.num_relations = num_relations
+        self.embedding_dim = embedding_dim
+        self.latent_dim    = latent_dim
+
+        # ─── Encoder: 1x1 Conv2d stack on the (B, 1, 3, d) "1-channel image" ───
+        conv_layers = []
+        current_in_channels  = 1
+        current_out_channels = encoder_base_channels
+        for _ in range(encoder_num_conv_layers):
+            conv_layers.append(
+                nn.Conv2d(current_in_channels, current_out_channels, kernel_size=(1, 1))
+            )
+            conv_layers.append(nn.LeakyReLU(leaky_relu_negative_slope, inplace=True))
+            current_in_channels  = current_out_channels
+            current_out_channels = current_out_channels * 2
+        self.encoder_conv_stack    = nn.Sequential(*conv_layers)
+        encoder_final_channel_count = current_in_channels
+
+        # After the conv stack we have (B, C_final, 3, d). Flatten per token,
+        # then project to a common hidden dim for the attention layer.
+        self.per_token_projection = nn.Linear(
+            encoder_final_channel_count * embedding_dim, bottleneck_hidden_dim,
+        )
+        self.self_attention_layer = nn.MultiheadAttention(
+            embed_dim=bottleneck_hidden_dim,
+            num_heads=encoder_num_attn_heads,
+            batch_first=True,
+        )
+        self.attention_layer_norm = nn.LayerNorm(bottleneck_hidden_dim)
+
+        # ─── Bottleneck: pool the 3 token features, concat with latent z ────
+        self.bottleneck_projection = nn.Linear(
+            bottleneck_hidden_dim * 3 + latent_dim,
+            bottleneck_hidden_dim,
+        )
+
+        # ─── Three output heads: one per triple position ────────────────────
+        # Each MLP maps the hidden state to logits over the appropriate vocab.
+        # head_entity_predictor -> logits over the ENTITY vocab (for new head)
+        # relation_predictor    -> logits over the RELATION vocab (for new relation)
+        # tail_entity_predictor -> logits over the ENTITY vocab (for new tail)
+        self.head_entity_predictor = nn.Sequential(
+            nn.Linear(bottleneck_hidden_dim, bottleneck_hidden_dim),
+            nn.ReLU(),
+            nn.Linear(bottleneck_hidden_dim, num_entities),
+        )
+        self.relation_predictor = nn.Sequential(
+            nn.Linear(bottleneck_hidden_dim, bottleneck_hidden_dim),
+            nn.ReLU(),
+            nn.Linear(bottleneck_hidden_dim, num_relations),
+        )
+        self.tail_entity_predictor = nn.Sequential(
+            nn.Linear(bottleneck_hidden_dim, bottleneck_hidden_dim),
+            nn.ReLU(),
+            nn.Linear(bottleneck_hidden_dim, num_entities),
+        )
+
+    def forward(self, clean_triple_embedding, latent_sample,
+                gumbel_temperature=1.0, return_soft_samples=True):
+        """Run G on a batch of clean triples.
+
+        Parameters
+        ----------
+        clean_triple_embedding : (B, 3, d) float — h, r, t embeddings stacked
+        latent_sample          : (B, d_z) float — per-sample noise vector
+        gumbel_temperature     : softmax temperature for the Gumbel sampler
+        return_soft_samples    : if True, also return near-one-hot Gumbel samples
+        """
+        batch_size = clean_triple_embedding.shape[0]
+
+        # ── Encoder ──────────────────────────────────────────────────
+        # Add a "channel" axis to treat the (3, d) triple as a 1-channel image.
+        # Shape: (B, 1, 3, d).
+        encoder_input = clean_triple_embedding.unsqueeze(1)
+        # 1x1 conv stack mixes the channel dimension only (no spatial mixing).
+        # Output: (B, C_final, 3, d).
+        encoder_conv_output = self.encoder_conv_stack(encoder_input)
+        # Rearrange so each of the 3 positions becomes a "token" with its
+        # own feature vector. Result: (B, 3, C_final * d).
+        per_token_features = (
+            encoder_conv_output
+            .permute(0, 2, 1, 3)
+            .contiguous()
+            .view(batch_size, 3, -1)
+        )
+        # Project to a common hidden dim. Shape: (B, 3, hidden).
+        projected_tokens = self.per_token_projection(per_token_features)
+        # Self-attention: each token can attend to the other two.
+        attention_output, _ = self.self_attention_layer(
+            projected_tokens, projected_tokens, projected_tokens,
+        )
+        # Residual + LayerNorm: standard transformer pattern.
+        refined_tokens = self.attention_layer_norm(projected_tokens + attention_output)
+
+        # ── Bottleneck: flatten tokens, concat latent z, project ────────
+        flattened_token_features = refined_tokens.flatten(1)           # (B, 3*hidden)
+        bottleneck_input = torch.cat(
+            [flattened_token_features, latent_sample], dim=1,
+        )                                                              # (B, 3*hidden + d_z)
+        bottleneck_hidden_state = self.bottleneck_projection(bottleneck_input)  # (B, hidden)
+
+        # ── Three heads: each predicts logits over its vocabulary ────
+        head_entity_logits = self.head_entity_predictor(bottleneck_hidden_state)
+        relation_logits    = self.relation_predictor(bottleneck_hidden_state)
+        tail_entity_logits = self.tail_entity_predictor(bottleneck_hidden_state)
+
+        generator_output = {
+            'head_entity_logits': head_entity_logits,
+            'relation_logits':    relation_logits,
+            'tail_entity_logits': tail_entity_logits,
+        }
+        if return_soft_samples:
+            generator_output['head_entity_soft_sample'] = gumbel_softmax_sample(
+                head_entity_logits, gumbel_temperature,
+            )
+            generator_output['relation_soft_sample'] = gumbel_softmax_sample(
+                relation_logits, gumbel_temperature,
+            )
+            generator_output['tail_entity_soft_sample'] = gumbel_softmax_sample(
+                tail_entity_logits, gumbel_temperature,
+            )
+        return generator_output
+
+
+class TripleDiscriminator(nn.Module):
+    """The discriminator (cGAN critic): scores (clean, candidate) pairs.
+
+    Pix2Pix-style: D sees BOTH the clean input and the candidate output, so
+    its judgement is "does this corruption make sense given this input?",
+    not just "does this triple look plausible?".
+
+    `spectral_norm` on every Linear caps the layer's Lipschitz constant,
+    preventing D from amplifying signals too aggressively. This is a known
+    stabiliser for GAN training - without it D often "wins" and G stops
+    learning.
+    """
+    def __init__(self, embedding_dim, hidden_dim=256):
+        super().__init__()
+        # The input is two (3, d) triple embeddings flattened and concatenated:
+        # 2 * 3 * embedding_dim = 6 * embedding_dim total dims.
+        self.mlp = nn.Sequential(
+            nn.utils.spectral_norm(nn.Linear(6 * embedding_dim, hidden_dim)),
+            nn.LeakyReLU(leaky_relu_negative_slope, inplace=True),
+            nn.utils.spectral_norm(nn.Linear(hidden_dim, hidden_dim // 2)),
+            nn.LeakyReLU(leaky_relu_negative_slope, inplace=True),
+            nn.utils.spectral_norm(nn.Linear(hidden_dim // 2, 1)),
+        )
+
+    def forward(self, clean_triple_embedding, candidate_triple_embedding):
+        # Flatten each (B, 3, d) -> (B, 3*d), concat -> (B, 6*d), then MLP.
+        discriminator_input = torch.cat(
+            [clean_triple_embedding.flatten(1), candidate_triple_embedding.flatten(1)],
+            dim=1,
+        )
+        return self.mlp(discriminator_input)   # (B, 1) raw logit
+
+
+def re_embed_soft_samples(
+    head_entity_soft_sample, relation_soft_sample, tail_entity_soft_sample,
+    entity_weight, relation_weight,
+):
+    """Turn the three soft samples back into a (B, 3, embedding_dim) triple embedding.
+
+    The trick: `head_entity_soft_sample` is shape (B, num_entities) and is
+    NEAR one-hot. Multiplying by the embedding weight matrix gives:
+
+        soft_sample @ entity_weight   ~=   entity_weight[argmax(soft_sample)]
+
+    i.e. approximately the embedding of the most-probable entity - BUT
+    differentiable, so gradients flow back through the soft sample into
+    the generator AND into the embedding matrices.
+    """
+    head_entity_embedding = head_entity_soft_sample @ entity_weight    # (B, d)
+    relation_embedding    = relation_soft_sample    @ relation_weight  # (B, d)
+    tail_entity_embedding = tail_entity_soft_sample @ entity_weight    # (B, d)
+    return torch.stack(
+        [head_entity_embedding, relation_embedding, tail_entity_embedding],
+        dim=1,
+    )   # (B, 3, d)
+
+
+# ─── Instantiate the model ──────────────────────────────────────────────
+entity_embedding   = EntityEmbedding(num_entities,  embedding_dim).to(compute_device)
+relation_embedding = RelationEmbedding(num_relations, embedding_dim).to(compute_device)
+
+generator_model = TripleGenerator(
+    num_entities=num_entities,
+    num_relations=num_relations,
+    embedding_dim=embedding_dim,
+    latent_dim=latent_dim,
+    encoder_base_channels=encoder_base_channels,
+    encoder_num_conv_layers=encoder_num_conv_layers,
+    encoder_num_attn_heads=encoder_num_attn_heads,
+    bottleneck_hidden_dim=bottleneck_hidden_dim,
+).to(compute_device)
+
+discriminator_model = TripleDiscriminator(
+    embedding_dim=embedding_dim,
+    hidden_dim=256,
+).to(compute_device)
+
+# Quick parameter counts so you can sanity-check the model size.
+print(f"Generator parameters:     {sum(p.numel() for p in generator_model.parameters()):,}")
+print(f"Discriminator parameters: {sum(p.numel() for p in discriminator_model.parameters()):,}")
+print(f"EntityEmbedding:          {sum(p.numel() for p in entity_embedding.parameters()):,} "
+      f"(|E|={num_entities} x d={embedding_dim})")
+print(f"RelationEmbedding:        {sum(p.numel() for p in relation_embedding.parameters()):,} "
+      f"(|R|={num_relations} x d={embedding_dim})")
+--- output -------------------------------------------------------------
+Generator parameters:     1,818,135
+Discriminator parameters: 186,881
+EntityEmbedding:          1,000 (|E|=10 x d=100)
+RelationEmbedding:        300 (|R|=3 x d=100)
+[runner] OK in 0.02s
+
+========================================================================
+CELL 8/15  (notebook index 16)
+========================================================================
+--- source -------------------------------------------------------------
+# Take 4 example training pairs to feed through the model.
+with torch.no_grad():
+    sanity_clean_indices  = training_clean_triples [:4].to(compute_device)
+    sanity_target_indices = training_target_triples[:4].to(compute_device)
+
+    # Look up embeddings for the clean triples.
+    sanity_head_embedding     = entity_embedding(sanity_clean_indices[:, 0])
+    sanity_relation_embedding = relation_embedding(sanity_clean_indices[:, 1])
+    sanity_tail_embedding     = entity_embedding(sanity_clean_indices[:, 2])
+    sanity_clean_triple_emb   = torch.stack(
+        [sanity_head_embedding, sanity_relation_embedding, sanity_tail_embedding],
+        dim=1,
+    )   # (4, 3, embedding_dim)
+
+    # Sample a latent z and run G.
+    sanity_latent = torch.randn(4, latent_dim, device=compute_device)
+    sanity_generator_output = generator_model(
+        sanity_clean_triple_emb, sanity_latent,
+        gumbel_temperature=gumbel_temperature_start, return_soft_samples=True,
+    )
+
+    # Re-embed the soft samples for the discriminator.
+    sanity_candidate_emb = re_embed_soft_samples(
+        sanity_generator_output['head_entity_soft_sample'],
+        sanity_generator_output['relation_soft_sample'],
+        sanity_generator_output['tail_entity_soft_sample'],
+        entity_embedding.lookup_weight(),
+        relation_embedding.lookup_weight(),
+    )
+
+    sanity_d_real = discriminator_model(sanity_clean_triple_emb, sanity_clean_triple_emb)
+    sanity_d_fake = discriminator_model(sanity_clean_triple_emb, sanity_candidate_emb)
+
+print(f"Clean triple emb shape:     {tuple(sanity_clean_triple_emb.shape)}")
+print(f"head_entity_logits shape:   {tuple(sanity_generator_output['head_entity_logits'].shape)}")
+print(f"relation_logits shape:      {tuple(sanity_generator_output['relation_logits'].shape)}")
+print(f"tail_entity_logits shape:   {tuple(sanity_generator_output['tail_entity_logits'].shape)}")
+print(f"Candidate emb shape:        {tuple(sanity_candidate_emb.shape)}")
+print(f"Discriminator output shape: {tuple(sanity_d_real.shape)}")
+print(f"D(clean, clean) mean: {sanity_d_real.mean().item():.3f}")
+print(f"D(clean, fake)  mean: {sanity_d_fake.mean().item():.3f}")
+--- output -------------------------------------------------------------
+Clean triple emb shape:     (4, 3, 100)
+head_entity_logits shape:   (4, 10)
+relation_logits shape:      (4, 3)
+tail_entity_logits shape:   (4, 10)
+Candidate emb shape:        (4, 3, 100)
+Discriminator output shape: (4, 1)
+D(clean, clean) mean: 0.118
+D(clean, fake)  mean: 0.127
+[runner] OK in 0.03s
+
+========================================================================
+CELL 9/15  (notebook index 18)
+========================================================================
+--- source -------------------------------------------------------------
+# ─── Training hyperparameters ────────────────────────────────────────────
+total_epochs       = 400
+learning_rate      = 1e-4
+adam_beta1         = 0.5
+adam_beta2         = 0.999
+loss_weight_reconstruction = 20.0   # CE on three heads (categorical analogue of Pix2Pix's L1)
+loss_weight_adversarial    = 1.0    # cGAN BCE
+loss_weight_diversity      = 0.5    # mode-seeking regulariser
+real_label_value           = 0.9    # one-sided label smoothing (D never sees a hard 1.0)
+fake_label_value           = 0.0
+
+# Instance noise on D inputs - decays linearly. Adds noise to BOTH inputs of D
+# at every forward, which prevents D from memorising the data manifold.
+instance_noise_std_start = 0.1
+instance_noise_std_end   = 0.01
+
+# Loss function objects (PyTorch wraps each loss in a stateful module).
+binary_cross_entropy_with_logits_loss = nn.BCEWithLogitsLoss().to(compute_device)
+cross_entropy_loss                    = nn.CrossEntropyLoss().to(compute_device)
+
+
+def add_instance_noise(clean_embedding, candidate_embedding, noise_std):
+    """Add fresh Gaussian noise to BOTH embeddings; same std for both. If
+    noise_std is zero (end of training), return inputs unchanged."""
+    if noise_std <= 0:
+        return clean_embedding, candidate_embedding
+    return (
+        clean_embedding     + torch.randn_like(clean_embedding)     * noise_std,
+        candidate_embedding + torch.randn_like(candidate_embedding) * noise_std,
+    )
+
+
+def mode_seeking_diversity_loss(candidate_1, candidate_2, latent_1, latent_2, epsilon=1e-6):
+    """Mao et al. CVPR 2019 mode-seeking regulariser.
+
+    Compares two candidates produced from DIFFERENT latents but the same
+    clean input. If the candidates are similar despite different latents,
+    the loss is close to 0 (bad — z is being ignored). If they're different
+    in proportion to the latents, the loss is more negative (good).
+
+    Since we minimise total_g_loss, "more negative L_div" means "more diverse" wins.
+    """
+    candidate_difference_magnitude = (candidate_1 - candidate_2).abs().mean()
+    latent_difference_magnitude    = (latent_1 - latent_2).abs().mean()
+    return -candidate_difference_magnitude / (latent_difference_magnitude + epsilon)
+
+
+def build_triple_embedding(triple_indices, entity_emb_module, relation_emb_module):
+    """Look up the (h, r, t) embeddings for a batch of triples and stack them.
+
+    triple_indices : (B, 3) long tensor [head_idx, relation_idx, tail_idx] per row
+    returns        : (B, 3, embedding_dim) float
+    """
+    return torch.stack(
+        [
+            entity_emb_module(triple_indices[:, 0]),
+            relation_emb_module(triple_indices[:, 1]),
+            entity_emb_module(triple_indices[:, 2]),
+        ],
+        dim=1,
+    )
+
+
+# ─── Optimisers ──────────────────────────────────────────────────────────
+# G's optimiser also trains the embedding matrices (E, R), because the
+# embeddings are part of G's parameter list. The intuition: the embeddings
+# learn jointly with G during the G-step, but stay frozen during the D-step
+# (we build them under no_grad there).
+generator_parameter_list = (
+    list(generator_model.parameters())
+    + list(entity_embedding.parameters())
+    + list(relation_embedding.parameters())
+)
+generator_optimizer = optim.Adam(
+    generator_parameter_list, lr=learning_rate, betas=(adam_beta1, adam_beta2),
+)
+# D's optimiser uses a smaller learning rate (0.25x) — a common GAN trick
+# that keeps D from "winning" too fast.
+discriminator_optimizer = optim.Adam(
+    discriminator_model.parameters(),
+    lr=learning_rate * 0.25,
+    betas=(adam_beta1, adam_beta2),
+)
+
+# ─── Histories (for the diagnostic plots in Step 9) ──────────────────────
+loss_history_g_adversarial    = []
+loss_history_g_reconstruction = []
+loss_history_g_diversity      = []
+loss_history_g_total          = []
+loss_history_d_total          = []
+discriminator_score_on_real_pair         = []
+discriminator_score_on_fake_pair_before_g = []
+discriminator_score_on_fake_pair_after_g  = []
+instance_noise_std_history    = []
+gumbel_temperature_history    = []
+
+print(f"Training: {total_epochs} epochs, {len(triple_pair_dataloader)} batches/epoch")
+print(f"loss_weights: recon={loss_weight_reconstruction}, "
+      f"adv={loss_weight_adversarial}, div={loss_weight_diversity}")
+print(f"G lr={learning_rate:.1e}, D lr={learning_rate * 0.25:.1e}")
+print(f"Instance noise std: {instance_noise_std_start} -> {instance_noise_std_end} (linear decay)")
+print(f"Gumbel temperature: {gumbel_temperature_start} -> {gumbel_temperature_end} "
+      f"(anneal during first half of training)")
+print("-" * 70)
+
+# Switch both networks into training mode (enables dropout, etc.).
+generator_model.train()
+discriminator_model.train()
+
+for epoch_index in range(total_epochs):
+    epoch_d_loss_sum   = 0.0
+    epoch_d_loss_count = 0
+
+    # Linearly decay instance noise std across all epochs.
+    epoch_progress_fraction = epoch_index / max(total_epochs - 1, 1)
+    current_instance_noise_std = (
+        instance_noise_std_start * (1 - epoch_progress_fraction)
+        + instance_noise_std_end * epoch_progress_fraction
+    )
+    instance_noise_std_history.append(current_instance_noise_std)
+
+    # Anneal Gumbel temperature over the first 50% of epochs, then hold.
+    anneal_progress_fraction = min(1.0, epoch_index / max(1, total_epochs // 2))
+    current_gumbel_temperature = (
+        gumbel_temperature_start * (1 - anneal_progress_fraction)
+        + gumbel_temperature_end * anneal_progress_fraction
+    )
+    gumbel_temperature_history.append(current_gumbel_temperature)
+
+    for clean_triple_indices_batch, target_triple_indices_batch in triple_pair_dataloader:
+        clean_triple_indices_batch  = clean_triple_indices_batch.to(compute_device)
+        target_triple_indices_batch = target_triple_indices_batch.to(compute_device)
+        batch_size = clean_triple_indices_batch.size(0)
+
+        # PatchGAN-style tiled labels would go here if D were a PatchGAN.
+        # Our D outputs (B, 1) so we use the same shape for labels.
+        real_label_tensor = torch.full(
+            (batch_size, 1), real_label_value,
+            device=compute_device, dtype=torch.float,
+        )
+        fake_label_tensor = torch.full(
+            (batch_size, 1), fake_label_value,
+            device=compute_device, dtype=torch.float,
+        )
+
+        # ═════════════════════════════════════════════════════════════════
+        # D-STEP: train the discriminator
+        # ─────────────────────────────────────────────────────────────────
+        # Build embeddings under no_grad: D doesn't update E or R; their
+        # gradient updates only happen during the G-step.
+        # ═════════════════════════════════════════════════════════════════
+        discriminator_model.zero_grad()
+        with torch.no_grad():
+            clean_triple_embedding_for_d_step = build_triple_embedding(
+                clean_triple_indices_batch, entity_embedding, relation_embedding,
+            )
+            target_triple_embedding_for_d_step = build_triple_embedding(
+                target_triple_indices_batch, entity_embedding, relation_embedding,
+            )
+            latent_for_d_step = torch.randn(batch_size, latent_dim, device=compute_device)
+            generator_output_for_d_step = generator_model(
+                clean_triple_embedding_for_d_step,
+                latent_for_d_step,
+                gumbel_temperature=current_gumbel_temperature,
+                return_soft_samples=True,
+            )
+            candidate_embedding_for_d_step = re_embed_soft_samples(
+                generator_output_for_d_step['head_entity_soft_sample'],
+                generator_output_for_d_step['relation_soft_sample'],
+                generator_output_for_d_step['tail_entity_soft_sample'],
+                entity_embedding.lookup_weight(),
+                relation_embedding.lookup_weight(),
+            )
+
+        # Real pair: (clean, target). D should output high score (-> 1).
+        clean_with_noise_real, target_with_noise_real = add_instance_noise(
+            clean_triple_embedding_for_d_step,
+            target_triple_embedding_for_d_step,
+            current_instance_noise_std,
+        )
+        d_score_on_real_pair = discriminator_model(clean_with_noise_real, target_with_noise_real)
+        d_loss_real_pair     = binary_cross_entropy_with_logits_loss(
+            d_score_on_real_pair, real_label_tensor,
+        )
+
+        # Fake pair: (clean, generator's candidate). D should output low score (-> 0).
+        clean_with_noise_fake, candidate_with_noise_fake = add_instance_noise(
+            clean_triple_embedding_for_d_step,
+            candidate_embedding_for_d_step,
+            current_instance_noise_std,
+        )
+        d_score_on_fake_pair = discriminator_model(clean_with_noise_fake, candidate_with_noise_fake)
+        d_loss_fake_pair     = binary_cross_entropy_with_logits_loss(
+            d_score_on_fake_pair, fake_label_tensor,
+        )
+
+        # Combine the two D losses and backprop in one call.
+        total_d_loss = d_loss_real_pair + d_loss_fake_pair
+        total_d_loss.backward()
+
+        d_mean_real_pair_score     = torch.sigmoid(d_score_on_real_pair).mean().item()
+        d_mean_fake_pair_score_before_g = torch.sigmoid(d_score_on_fake_pair).mean().item()
+
+        # Clip gradients to prevent explosions.
+        torch.nn.utils.clip_grad_norm_(discriminator_model.parameters(), max_norm=5.0)
+        discriminator_optimizer.step()
+        epoch_d_loss_sum   += total_d_loss.item()
+        epoch_d_loss_count += 1
+
+        # ═════════════════════════════════════════════════════════════════
+        # G-STEP: train the generator (and the embedding matrices E, R)
+        # ─────────────────────────────────────────────────────────────────
+        # Embeddings rebuilt WITH gradient. Two independent latents z_1, z_2
+        # are needed for the mode-seeking diversity regulariser.
+        # ═════════════════════════════════════════════════════════════════
+        generator_optimizer.zero_grad()
+
+        clean_triple_embedding_for_g_step = build_triple_embedding(
+            clean_triple_indices_batch, entity_embedding, relation_embedding,
+        )
+        latent_sample_1 = torch.randn(batch_size, latent_dim, device=compute_device)
+        latent_sample_2 = torch.randn(batch_size, latent_dim, device=compute_device)
+
+        generator_output_z1 = generator_model(
+            clean_triple_embedding_for_g_step, latent_sample_1,
+            gumbel_temperature=current_gumbel_temperature, return_soft_samples=True,
+        )
+        generator_output_z2 = generator_model(
+            clean_triple_embedding_for_g_step, latent_sample_2,
+            gumbel_temperature=current_gumbel_temperature, return_soft_samples=True,
+        )
+
+        candidate_embedding_from_z1 = re_embed_soft_samples(
+            generator_output_z1['head_entity_soft_sample'],
+            generator_output_z1['relation_soft_sample'],
+            generator_output_z1['tail_entity_soft_sample'],
+            entity_embedding.lookup_weight(),
+            relation_embedding.lookup_weight(),
+        )
+        candidate_embedding_from_z2 = re_embed_soft_samples(
+            generator_output_z2['head_entity_soft_sample'],
+            generator_output_z2['relation_soft_sample'],
+            generator_output_z2['tail_entity_soft_sample'],
+            entity_embedding.lookup_weight(),
+            relation_embedding.lookup_weight(),
+        )
+
+        # ── Reconstruction loss: CE on each of the three heads (z_1 branch).
+        # This is the SUPERVISED signal: TRIC tells us exactly what the
+        # corrupted triple should be; CE penalises G if it predicts something else.
+        loss_reconstruction_head = cross_entropy_loss(
+            generator_output_z1['head_entity_logits'],
+            target_triple_indices_batch[:, 0],
+        )
+        loss_reconstruction_relation = cross_entropy_loss(
+            generator_output_z1['relation_logits'],
+            target_triple_indices_batch[:, 1],
+        )
+        loss_reconstruction_tail = cross_entropy_loss(
+            generator_output_z1['tail_entity_logits'],
+            target_triple_indices_batch[:, 2],
+        )
+        loss_reconstruction = (
+            loss_reconstruction_head + loss_reconstruction_relation + loss_reconstruction_tail
+        )
+
+        # ── Adversarial loss: G tries to fool D into thinking its output is real.
+        clean_with_noise_g_step, candidate_with_noise_g_step = add_instance_noise(
+            clean_triple_embedding_for_g_step,
+            candidate_embedding_from_z1,
+            current_instance_noise_std,
+        )
+        d_score_on_fake_pair_for_g_step = discriminator_model(
+            clean_with_noise_g_step, candidate_with_noise_g_step,
+        )
+        loss_adversarial = binary_cross_entropy_with_logits_loss(
+            d_score_on_fake_pair_for_g_step, real_label_tensor,
+        )
+        d_mean_fake_pair_score_after_g = torch.sigmoid(d_score_on_fake_pair_for_g_step).mean().item()
+
+        # ── Diversity loss: penalise G if z_1 and z_2 produce similar outputs.
+        loss_diversity = mode_seeking_diversity_loss(
+            candidate_embedding_from_z1, candidate_embedding_from_z2,
+            latent_sample_1, latent_sample_2,
+        )
+
+        # ── Combined G loss with weights.
+        total_g_loss = (
+            loss_weight_reconstruction * loss_reconstruction
+            + loss_weight_adversarial    * loss_adversarial
+            + loss_weight_diversity      * loss_diversity
+        )
+        total_g_loss.backward()
+        torch.nn.utils.clip_grad_norm_(generator_parameter_list, max_norm=5.0)
+        generator_optimizer.step()
+
+        # ── Record histories for the diagnostic plots in Step 9.
+        loss_history_g_adversarial.append(loss_adversarial.item())
+        loss_history_g_reconstruction.append(loss_reconstruction.item())
+        loss_history_g_diversity.append(loss_diversity.item())
+        loss_history_g_total.append(total_g_loss.item())
+        loss_history_d_total.append(total_d_loss.item())
+        discriminator_score_on_real_pair.append(d_mean_real_pair_score)
+        discriminator_score_on_fake_pair_before_g.append(d_mean_fake_pair_score_before_g)
+        discriminator_score_on_fake_pair_after_g.append(d_mean_fake_pair_score_after_g)
+
+    # Print a status line every 15 epochs (and on the first epoch).
+    if (epoch_index + 1) % 15 == 0 or epoch_index == 0:
+        print(
+            f"[{epoch_index + 1:3d}/{total_epochs}]  "
+            f"L_D: {epoch_d_loss_sum / max(epoch_d_loss_count, 1):.4f}  "
+            f"L_G_adv: {loss_adversarial.item():.4f}  "
+            f"L_G_recon: {loss_reconstruction.item():.4f}  "
+            f"L_G_div: {loss_diversity.item():+.4f}  "
+            f"D(real): {d_mean_real_pair_score:.3f}  "
+            f"D(fake): {d_mean_fake_pair_score_before_g:.3f}/{d_mean_fake_pair_score_after_g:.3f}  "
+            f"noise_std: {current_instance_noise_std:.3f}  "
+            f"gumbel_tau: {current_gumbel_temperature:.2f}"
+        )
+
+print("-" * 70)
+print("Training Complete!")
+--- output -------------------------------------------------------------
+Training: 400 epochs, 125 batches/epoch
+loss_weights: recon=20.0, adv=1.0, div=0.5
+G lr=1.0e-04, D lr=2.5e-05
+Instance noise std: 0.1 -> 0.01 (linear decay)
+Gumbel temperature: 1.0 -> 0.5 (anneal during first half of training)
+----------------------------------------------------------------------
+[  1/400]  L_D: 1.3882  L_G_adv: 0.7336  L_G_recon: 2.1568  L_G_div: -0.0435  D(real): 0.475  D(fake): 0.476/0.476  noise_std: 0.100  gumbel_tau: 1.00
