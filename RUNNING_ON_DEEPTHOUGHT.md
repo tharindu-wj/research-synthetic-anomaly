@@ -62,14 +62,14 @@ sbatch slurm/run_pipeline.slurm               # real submit -> prints a job id
 squeue -u $USER                               # PD = pending, R = running
 tail -f kg_gan_pipeline-<jobid>.out.txt       # live log (cells executing)
 
-ls /scratch/$USER/kg_runs/<jobid>/            # figure_01..05.png + run.log
+ls ~/scratch/kg_runs/<jobid>/                 # figure_01..05.png + run.log
 ```
 
 **Success** = job ends `COMPLETED`, the log's last line reads
 `Finished ... 0 failure(s)`, and the results dir holds 5 PNGs + `run.log`.
 
-> Results land in `/scratch` (volatile). Copy anything you want to keep to
-> `/RDrive` or off the HPC — `/scratch` and `/cluster` are not backed up.
+> Results land in `~/scratch` (volatile). Copy anything you want to keep to
+> `/RDrive` or off the HPC — HPC storage is not backed up.
 
 ## Troubleshooting
 

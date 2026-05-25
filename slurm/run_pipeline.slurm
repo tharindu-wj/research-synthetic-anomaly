@@ -19,11 +19,14 @@
 # Note: -u is deliberately omitted; conda activation trips on unbound vars.
 set -eo pipefail
 
-# ---- EDIT THESE TWO PATHS to match your HPC layout ----
+# ---- EDIT THESE PATHS to match your HPC layout ----
 PROJECT_DIR="$HOME/research-synthetic-anomaly"
 CONDA_ENV="$HOME/envs/kggan"
+# Results go to your writable ~/scratch (DeepThought provisions it per account).
+# Note: do NOT use /scratch/$USER — top-level creation there is denied. The
+# documented "real" scratch path is /scratch/user/$USER if you prefer that.
+RESULTS_DIR="$HOME/scratch/kg_runs/$SLURM_JOB_ID"
 
-RESULTS_DIR="/scratch/$USER/kg_runs/$SLURM_JOB_ID"
 mkdir -p "$RESULTS_DIR"
 
 echo "Job $SLURM_JOB_ID on $(hostname) starting $(date)"
