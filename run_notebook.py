@@ -1,4 +1,4 @@
-#!/usr/bin/env python
+#!/usr/bin/env python3
 """Execute a Jupyter notebook as a plain script - no Jupyter server, no UI.
 
 Every code cell is run in order inside one shared namespace, streaming output

@@ -962,3 +962,4 @@ Gumbel temperature: 1.0 -> 0.5 (anneal during first half of training)
 ----------------------------------------------------------------------
 [  1/400]  L_D: 1.3882  L_G_adv: 0.7336  L_G_recon: 2.1568  L_G_div: -0.0435  D(real): 0.475  D(fake): 0.476/0.476  noise_std: 0.100  gumbel_tau: 1.00
 [ 15/400]  L_D: 1.3267  L_G_adv: 0.7869  L_G_recon: 0.6165  L_G_div: -0.0136  D(real): 0.477  D(fake): 0.444/0.446  noise_std: 0.097  gumbel_tau: 0.96
+[ 30/400]  L_D: 1.3034  L_G_adv: 0.8194  L_G_recon: 0.6704  L_G_div: -0.0137  D(real): 0.476  D(fake): 0.437/0.429  noise_std: 0.093  gumbel_tau: 0.93
