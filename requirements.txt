@@ -1,0 +1,15 @@
+# Dependencies for the KG-corruption pipeline (src/knowledge_graph_clone.ipynb),
+# executed headless via run_notebook.py.
+#
+# torch is installed SEPARATELY so you can choose the CPU or CUDA wheel index:
+#   CPU  : pip install torch --index-url https://download.pytorch.org/whl/cpu
+#   CUDA : pip install torch --index-url https://download.pytorch.org/whl/cu121
+# See docs/RUNNING_ON_DEEPTHOUGHT.md for the full setup.
+#
+# torch_geometric / torchinfo are intentionally omitted: the notebook's
+# "%pip install" line is skipped by run_notebook.py and neither is imported.
+
+numpy
+matplotlib
+networkx
+nbformat

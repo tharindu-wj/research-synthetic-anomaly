@@ -1,0 +1,4 @@
+# Keep shell / SLURM scripts as LF so they run on the Linux HPC.
+# A CRLF line ending breaks the shebang: "/bin/bash^M: bad interpreter".
+*.slurm  text eol=lf
+*.sh     text eol=lf
