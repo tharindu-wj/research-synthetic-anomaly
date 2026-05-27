@@ -1,4 +1,4 @@
-"""(Re)generate the dummy KG TSV files at datasets/dummy_kg/.
+"""(Re)generate the dummy KG TSV files at data/dummy_kg/.
 
 Run this module (or call write_dummy_kg()) when you want to recreate the
 dummy KG files from this single source of truth. The committed TSV files
@@ -78,7 +78,7 @@ def _write_tsv(path: Path, rows: Iterable[Iterable[str]]) -> None:
             output_file.write("\t".join(row) + "\n")
 
 
-def write_dummy_kg(output_directory: str | Path = "datasets/dummy_kg") -> Path:
+def write_dummy_kg(output_directory: str | Path = "data/dummy_kg") -> Path:
     """Write the dummy KG TSV files into `output_directory`.
 
     Creates the directory if it doesn't exist. Files written:

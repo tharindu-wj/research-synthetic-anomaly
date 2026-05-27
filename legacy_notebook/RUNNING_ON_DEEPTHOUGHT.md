@@ -1,8 +1,13 @@
-# Running the pipeline on DeepThought (Flinders HPC)
+# Running the legacy notebook on DeepThought (Flinders HPC)
 
-How to run `src/knowledge_graph_clone.ipynb` on the DeepThought HPC as a SLURM
-batch job on the **CPU (`general`) partition**, using the headless runner
-[`run_notebook.py`](run_notebook.py).
+How to run `legacy_notebook/knowledge_graph_clone.ipynb` on the DeepThought
+HPC as a SLURM batch job on the **CPU (`general`) partition**, using the
+headless runner [`run_notebook.py`](run_notebook.py).
+
+> This guide applies only to the **frozen research notebook**. The live
+> ADKGD pipeline (`scripts/train_gan.py` + `scripts/generate_gan_tsv.py`)
+> will get its own SLURM wrapper as part of Phase 5; see the top-level
+> [README](../README.md).
 
 ## Why batch (not the login node)
 
@@ -42,8 +47,9 @@ A future JupyterHub kernel would instead require a **separate Python ≤ 3.9** e
 
 ## 2. Point the job script at your paths
 
-Edit the two variables at the top of [`slurm/run_pipeline.slurm`](slurm/run_pipeline.slurm)
-if your layout differs from the defaults:
+Edit the two variables at the top of
+[`slurm/run_pipeline.slurm`](slurm/run_pipeline.slurm) if your layout
+differs from the defaults:
 
 ```bash
 PROJECT_DIR="$HOME/research-synthetic-anomaly"
@@ -56,8 +62,8 @@ CONDA_ENV="$HOME/envs/kggan"
 cd $HOME/research-synthetic-anomaly
 git pull                                      # get requirements.txt + slurm script
 
-sbatch --test-only slurm/run_pipeline.slurm   # dry-run: validate the script
-sbatch slurm/run_pipeline.slurm               # real submit -> prints a job id
+sbatch --test-only legacy_notebook/slurm/run_pipeline.slurm   # dry-run: validate the script
+sbatch legacy_notebook/slurm/run_pipeline.slurm               # real submit -> prints a job id
 
 squeue -u $USER                               # PD = pending, R = running
 tail -f kg_gan_pipeline-<jobid>.out.txt       # live log (cells executing)
@@ -77,15 +83,16 @@ ls ~/scratch/kg_runs/<jobid>/                 # figure_01..05.png + run.log
 |---|---|
 | `module: command not found` or `Miniconda3` missing | `module avail miniconda` and use the exact name (maybe `miniconda/3.0`). |
 | `CommandNotFoundError: conda activate` | Ensure the `source "$(conda info --base)/etc/profile.d/conda.sh"` line ran before `conda activate`. |
-| `/bin/bash^M: bad interpreter` | CRLF line endings. `.gitattributes` forces LF on checkout; if needed run `dos2unix slurm/run_pipeline.slurm`. |
+| `/bin/bash^M: bad interpreter` | CRLF line endings. `.gitattributes` forces LF on checkout; if needed run `dos2unix legacy_notebook/slurm/run_pipeline.slurm`. |
 | Job killed, `oom-kill` in log | Raise `--mem` in the script (e.g. `--mem=16G`). |
 | `ModuleNotFoundError` for torch/numpy/... | The env wasn't built or wasn't activated — redo step 1; confirm `CONDA_ENV` path. |
 | Pending forever | Cluster busy; lower `--time` (better backfill) or wait. Check with `squeue -u $USER --start`. |
 
 ## Running on GPU (Tesla V100)
 
-Use the dedicated [`slurm/run_pipeline_gpu.slurm`](slurm/run_pipeline_gpu.slurm)
-— it adds `--partition=gpu --gres=gpu:tesla_v100:1` and a pre-flight check that
+Use the dedicated
+[`slurm/run_pipeline_gpu.slurm`](slurm/run_pipeline_gpu.slurm) — it adds
+`--partition=gpu --gres=gpu:tesla_v100:1` and a pre-flight check that
 fails fast if torch can't see the GPU. The notebook auto-selects CUDA via
 `torch.cuda.is_available()`, so no notebook change is needed.
 
@@ -104,7 +111,7 @@ python -m pip install torch --index-url https://download.pytorch.org/whl/cu121
 python -c "import torch; print('torch', torch.__version__, '| cuda build', torch.version.cuda)"
 
 # 3. Submit:
-sbatch slurm/run_pipeline_gpu.slurm
+sbatch legacy_notebook/slurm/run_pipeline_gpu.slurm
 ```
 
 Confirm it actually used the GPU: the log should print `GPU: Tesla V100-...` and

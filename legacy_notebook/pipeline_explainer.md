@@ -39,7 +39,7 @@ variants.
 
 ```
 ┌─────────────────────────────────────────────────────────────────────────────┐
-│  datasets/dummy_kg/                                                         │
+│  data/dummy_kg/                                                             │
 │  ├── train.txt              /dummy/Alice /dummy/born_in /dummy/Australia... │
 │  ├── entity_metadata.txt    /dummy/Alice  Alice  Person                     │
 │  └── relation_metadata.txt  /dummy/born_in  born_in                         │
@@ -101,7 +101,7 @@ variants.
 **Call site (notebook Step 2):**
 
 ```python
-knowledge_graph = load_kg('datasets/dummy_kg')
+knowledge_graph = load_kg('data/dummy_kg')
 ```
 
 **Code:** [kg_data/loader.py](kg_data/loader.py).
@@ -659,6 +659,6 @@ If you can answer these, you understand the pipeline:
    sources of randomness?
 9. The pipeline never builds an adjacency tensor. Where does adjacency get
    built on-demand, and why only there?
-10. If we replaced `datasets/dummy_kg` with FB15k-237 (N=14.5k, R=237),
+10. If we replaced `data/dummy_kg` with FB15k-237 (N=14.5k, R=237),
     which parts of the pipeline would scale unchanged, and which would
     slow down? Why is the bottleneck not memory anymore?

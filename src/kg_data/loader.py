@@ -2,7 +2,7 @@
 
 The loader takes a directory like::
 
-    datasets/dummy_kg/
+    data/dummy_kg/
         train.txt              REQUIRED - tab-separated head, relation, tail
         valid.txt              OPTIONAL - validation split (may be empty)
         test.txt               OPTIONAL - test split (may be empty)
@@ -218,6 +218,117 @@ def load_kg(dataset_directory: str | Path) -> KnowledgeGraph:
         test_triples=test_triples_strings,
         triples_idx=triples_idx,
         triple_set_idx=triple_set_idx,
+        entity_id_to_row=entity_id_to_row,
+        relation_id_to_channel=relation_id_to_channel,
+        node_labels=node_labels,
+        node_types=node_types,
+        relation_names=relation_names,
+        dataset_name=dataset_directory.name,
+    )
+
+
+def load_kg_union(dataset_directory: str | Path) -> KnowledgeGraph:
+    """Load a KG with vocab and triple set built from the UNION of all three splits.
+
+    The standard `load_kg` builds vocabularies and the triple set from
+    `train.txt` only, which mirrors how knowledge-graph-completion code
+    typically treats the three splits.
+
+    For the ADKGD synthetic-anomaly task we need the opposite: the GAN
+    sees one big graph (all 310k FB15k-237 triples), and the "is this
+    triple real?" check during anomaly generation must consult the union
+    so we never emit a triple that exists in train OR valid OR test.
+
+    Behaviour vs `load_kg`:
+      * `triples`        - still the training split (preserved so callers
+                           that look at the raw training file still work).
+      * `valid_triples`  - validation split (unchanged).
+      * `test_triples`   - test split (unchanged).
+      * `triples_idx`    - UNION of all three splits, integer-indexed.
+      * `triple_set_idx` - set form of the union, for O(1) "exists?" checks.
+      * `entity_id_to_row` / `relation_id_to_channel` - built from the
+        UNION of strings appearing across all three files.
+    """
+    dataset_directory = Path(dataset_directory)
+    if not dataset_directory.is_dir():
+        raise FileNotFoundError(f"Dataset directory not found: {dataset_directory}")
+
+    training_triples_strings   = _read_triples_tsv(dataset_directory / "train.txt")
+    validation_triples_strings = _read_triples_tsv(dataset_directory / "valid.txt")
+    test_triples_strings       = _read_triples_tsv(dataset_directory / "test.txt")
+    if not training_triples_strings:
+        raise ValueError(f"No training triples found at {dataset_directory / 'train.txt'}")
+
+    union_triples_strings: List[Tuple[str, str, str]] = (
+        list(training_triples_strings)
+        + list(validation_triples_strings)
+        + list(test_triples_strings)
+    )
+
+    # Build vocab from the UNION, first-seen order across train → valid → test.
+    entity_ids_in_order:   List[str] = []
+    relation_ids_in_order: List[str] = []
+    entities_already_seen:  set = set()
+    relations_already_seen: set = set()
+    for head_string, relation_string, tail_string in union_triples_strings:
+        for entity_string in (head_string, tail_string):
+            if entity_string not in entities_already_seen:
+                entities_already_seen.add(entity_string)
+                entity_ids_in_order.append(entity_string)
+        if relation_string not in relations_already_seen:
+            relations_already_seen.add(relation_string)
+            relation_ids_in_order.append(relation_string)
+
+    entity_id_to_row       = {entity_id: row_index
+                              for row_index, entity_id in enumerate(entity_ids_in_order)}
+    relation_id_to_channel = {relation_id: channel_index
+                              for channel_index, relation_id in enumerate(relation_ids_in_order)}
+
+    entity_metadata_rows = _read_metadata_tsv(
+        dataset_directory / "entity_metadata.txt", expected_num_columns=3,
+    )
+    entity_id_to_display_name: Dict[str, str] = {}
+    entity_id_to_type:         Dict[str, str] = {}
+    for entity_id, display_name, entity_type in entity_metadata_rows:
+        entity_id_to_display_name[entity_id] = display_name or entity_id
+        entity_id_to_type[entity_id]         = entity_type or "unknown"
+
+    relation_metadata_rows = _read_metadata_tsv(
+        dataset_directory / "relation_metadata.txt", expected_num_columns=2,
+    )
+    relation_id_to_display_name: Dict[str, str] = {}
+    for relation_id, display_name in relation_metadata_rows:
+        relation_id_to_display_name[relation_id] = display_name or relation_id
+
+    node_labels = {
+        row_index: entity_id_to_display_name.get(entity_id, entity_id)
+        for entity_id, row_index in entity_id_to_row.items()
+    }
+    node_types = {
+        row_index: entity_id_to_type.get(entity_id, "unknown")
+        for entity_id, row_index in entity_id_to_row.items()
+    }
+    relation_names = [
+        relation_id_to_display_name.get(relation_id, relation_id)
+        for relation_id in relation_ids_in_order
+    ]
+
+    union_triples_idx: List[Triple] = [
+        (
+            entity_id_to_row[head_string],
+            relation_id_to_channel[relation_string],
+            entity_id_to_row[tail_string],
+        )
+        for head_string, relation_string, tail_string in union_triples_strings
+    ]
+    union_triple_set_idx: Set[Triple] = set(union_triples_idx)
+
+    return KnowledgeGraph(
+        triples=training_triples_strings,
+        valid_triples=validation_triples_strings,
+        test_triples=test_triples_strings,
+        triples_idx=union_triples_idx,
+        triple_set_idx=union_triple_set_idx,
         entity_id_to_row=entity_id_to_row,
         relation_id_to_channel=relation_id_to_channel,
         node_labels=node_labels,

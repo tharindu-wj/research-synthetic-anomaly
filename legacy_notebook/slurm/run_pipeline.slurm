@@ -1,11 +1,12 @@
 #!/bin/bash
-# Submit the KG-corruption pipeline (src/knowledge_graph_clone.ipynb) as a
-# batch job on DeepThought's CPU (general) partition.
+# Submit the LEGACY research notebook
+# (legacy_notebook/knowledge_graph_clone.ipynb) as a batch job on
+# DeepThought's CPU (general) partition.
 #
-#   sbatch slurm/run_pipeline.slurm
+#   sbatch legacy_notebook/slurm/run_pipeline.slurm
 #
 # One-time env setup must be done first on the LOGIN node (compute nodes have no
-# internet). See docs/RUNNING_ON_DEEPTHOUGHT.md.
+# internet). See ../RUNNING_ON_DEEPTHOUGHT.md.
 
 #SBATCH --job-name=kg_gan_pipeline
 #SBATCH --output=%x-%j.out.txt        # written to the submit dir; %x=name %j=jobid
@@ -44,8 +45,8 @@ conda activate "$CONDA_ENV"
 export OMP_NUM_THREADS="$SLURM_CPUS_PER_TASK"
 export MKL_NUM_THREADS="$SLURM_CPUS_PER_TASK"
 
-python "$PROJECT_DIR/run_notebook.py" \
-    "$PROJECT_DIR/src/knowledge_graph_clone.ipynb" \
+python "$PROJECT_DIR/legacy_notebook/run_notebook.py" \
+    "$PROJECT_DIR/legacy_notebook/knowledge_graph_clone.ipynb" \
     --outdir "$RESULTS_DIR"
 
 echo "Done $(date). Results (figures + run.log) in: $RESULTS_DIR"

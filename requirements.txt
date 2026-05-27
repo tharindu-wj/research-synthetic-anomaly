@@ -4,7 +4,7 @@
 # torch is installed SEPARATELY so you can choose the CPU or CUDA wheel index:
 #   CPU  : pip install torch --index-url https://download.pytorch.org/whl/cpu
 #   CUDA : pip install torch --index-url https://download.pytorch.org/whl/cu121
-# See docs/RUNNING_ON_DEEPTHOUGHT.md for the full setup.
+# See legacy_notebook/RUNNING_ON_DEEPTHOUGHT.md for the full setup.
 #
 # torch_geometric / torchinfo are intentionally omitted: the notebook's
 # "%pip install" line is skipped by run_notebook.py and neither is imported.
@@ -13,3 +13,7 @@ numpy
 matplotlib
 networkx
 nbformat
+# Used by src/kg_data/relation_signature_types.py to derive entity
+# pseudo-types from relation signatures (TF-IDF + truncated SVD + KMeans).
+scikit-learn
+scipy

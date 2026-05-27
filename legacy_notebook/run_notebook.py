@@ -11,7 +11,7 @@ to the console AND a log file in real time. It hardens the naive
 * matplotlib runs headless (Agg backend) and ``plt.show()`` is patched to save
   each figure as a PNG instead of blocking on a GUI window.
 * the working directory is switched to the notebook's folder, so its relative
-  imports (``from kg_data import ...``) and data paths (``datasets/dummy_kg``)
+  imports (``from kg_data import ...``) and data paths (``data/dummy_kg``)
   resolve exactly as they do inside Jupyter.
 * stdout / stderr / log are forced to UTF-8 so the notebook's box-drawing and
   math characters (─ ═ ≈) don't crash the Windows cp1252 console.
