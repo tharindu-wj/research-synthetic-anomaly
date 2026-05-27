@@ -1,3 +1,0 @@
-/dummy/born_in	born_in
-/dummy/married_to	married_to
-/dummy/lives_in	lives_in
