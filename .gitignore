@@ -7,5 +7,4 @@ papers
 .claude
 temp
 outputs
-data/FB15K
 notebook_run_*
