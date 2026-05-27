@@ -1,6 +1,7 @@
 #!/bin/bash
-# Train the ADKGD anomaly-generating GAN and sample the negatives TSV in one
-# GPU allocation on Flinders' DeepThought cluster (Tesla V100 partition).
+# Train the kggan (KG-corruption GAN whose output feeds ADKGD's negatives
+# loader) and sample the negatives TSV in one GPU allocation on Flinders'
+# DeepThought cluster (Tesla V100 partition).
 #
 #   sbatch slurm/run_gan_train.slurm
 #
@@ -27,7 +28,7 @@
 #   docs/deepthoughtdocs-flinders-edu-au-en-latest.pdf   - full HPC user guide
 #   legacy_notebook/RUNNING_ON_DEEPTHOUGHT.md            - distilled setup notes
 
-#SBATCH --job-name=adkgd_gan
+#SBATCH --job-name=kggan_train
 #SBATCH --output=%x-%j.out.txt        # written to the submit dir; %x=name %j=jobid
 #SBATCH --error=%x-%j.err.txt
 #SBATCH --time=04:00:00               # tune down once a real run completes
@@ -43,7 +44,7 @@ set -eo pipefail
 # ─── EDIT-THESE PATHS to match your HPC layout ──────────────────────────
 PROJECT_DIR="${PROJECT_DIR:-$HOME/research-synthetic-anomaly}"
 CONDA_ENV="${CONDA_ENV:-$HOME/envs/kggan}"
-RESULTS_DIR="${RESULTS_DIR:-$HOME/scratch/adkgd_runs/$SLURM_JOB_ID}"
+RESULTS_DIR="${RESULTS_DIR:-$HOME/scratch/kggan_runs/$SLURM_JOB_ID}"
 
 # ─── Pipeline knobs (overridable per submission via env vars) ───────────
 DATASET_DIR="${DATASET_DIR:-data/FB15K}"

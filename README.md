@@ -141,11 +141,12 @@ scp outputs/gan_negatives.tsv  <hpc>:adkgd/data/FB15K/gan_negatives.tsv
 ### Phase 5: HPC run (Flinders DeepThought)
 
 Steps 2 and 3 above are wrapped into one GPU SLURM job at
-[slurm/run_gan_train.slurm](slurm/run_gan_train.slurm). It allocates one
-Tesla V100, asserts `torch.cuda.is_available()`, verifies
-`data/FB15K/entity_metadata.txt` exists (run `build_pseudo_types.py` on
-the login node first), runs `train_gan.py` then `generate_gan_tsv.py`,
-and copies the final TSV into `~/scratch/adkgd_runs/<jobid>/`.
+[slurm/run_gan_train.slurm](slurm/run_gan_train.slurm) (job name:
+`kggan_train`). It allocates one Tesla V100, asserts
+`torch.cuda.is_available()`, verifies `data/FB15K/entity_metadata.txt`
+exists (run `build_pseudo_types.py` on the login node first), runs
+`train_gan.py` then `generate_gan_tsv.py`, and copies the final TSV into
+`~/scratch/kggan_runs/<jobid>/`.
 
 ```bash
 # One-time login-node setup (see legacy_notebook/RUNNING_ON_DEEPTHOUGHT.md
@@ -161,8 +162,8 @@ DATASET_DIR=data/other_kg TARGET_POOL=200000 sbatch slurm/run_gan_train.slurm
 
 # Track and collect:
 squeue -u $USER
-tail -f adkgd_gan-<jobid>.out.txt
-ls ~/scratch/adkgd_runs/<jobid>/
+tail -f kggan_train-<jobid>.out.txt
+ls ~/scratch/kggan_runs/<jobid>/
 ```
 
 The job ends `COMPLETED` and `gan_negatives.tsv` passes preflight when
