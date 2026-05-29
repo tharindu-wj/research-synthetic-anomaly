@@ -1,13 +1,13 @@
 #!/bin/bash
-# Train the kggan (KG-corruption GAN whose output feeds ADKGD's negatives
-# loader) and sample the negatives TSV in one GPU allocation on Flinders'
-# DeepThought cluster (Tesla V100 partition).
+# Train the kggan (KG-corruption GAN whose output feeds ADKGD's negative
+# sampler) and export the per-positive hashmap TSV in one GPU allocation
+# on Flinders' DeepThought cluster (Tesla V100 partition).
 #
 #   sbatch slurm/run_gan_train.slurm
 #
 # Pipeline:
-#   scripts/train_gan.py     ->  outputs/checkpoints/<CKPT>
-#   scripts/generate_gan_tsv.py  ->  outputs/<TSV>   (auto-runs preflight)
+#   scripts/train_gan.py            ->  outputs/checkpoints/<CKPT>
+#   scripts/generate_gan_hashmap.py ->  outputs/<HASHMAP>   (auto-runs preflight)
 #
 # Prerequisites (run ONCE on the login node before submitting):
 #   1. Build the conda env (see legacy_notebook/RUNNING_ON_DEEPTHOUGHT.md):
@@ -22,7 +22,7 @@
 #
 # Override hyperparameters via env vars (no script edits required):
 #   EPOCHS=200 BATCH_SIZE=512 sbatch slurm/run_gan_train.slurm
-#   DATASET_DIR=data/other_kg TARGET_POOL=200000 sbatch slurm/run_gan_train.slurm
+#   DATASET_DIR=data/other_kg sbatch slurm/run_gan_train.slurm
 #
 # References:
 #   docs/deepthoughtdocs-flinders-edu-au-en-latest.pdf   - full HPC user guide
@@ -49,23 +49,22 @@ RESULTS_DIR="${RESULTS_DIR:-$HOME/scratch/kggan_runs/$SLURM_JOB_ID}"
 # ─── Pipeline knobs (overridable per submission via env vars) ───────────
 DATASET_DIR="${DATASET_DIR:-data/FB15K}"
 CKPT_PATH="${CKPT_PATH:-outputs/checkpoints/fb15k.pt}"
-TSV_PATH="${TSV_PATH:-outputs/gan_negatives.tsv}"
+HASHMAP_PATH="${HASHMAP_PATH:-outputs/gan_hashmap.tsv}"
 EPOCHS="${EPOCHS:-400}"
 BATCH_SIZE="${BATCH_SIZE:-256}"
-TARGET_POOL="${TARGET_POOL:-400000}"
-SAMPLES_PER_TRIPLE="${SAMPLES_PER_TRIPLE:-2}"
+EXPORT_BATCH_SIZE="${EXPORT_BATCH_SIZE:-256}"
 
 mkdir -p "$RESULTS_DIR"
 mkdir -p "$PROJECT_DIR/outputs/checkpoints"
 
 echo "Job $SLURM_JOB_ID on $(hostname) starting $(date)"
-echo "Project    : $PROJECT_DIR"
-echo "Env        : $CONDA_ENV"
-echo "Results    : $RESULTS_DIR"
-echo "Dataset    : $DATASET_DIR"
-echo "Checkpoint : $CKPT_PATH"
-echo "TSV out    : $TSV_PATH"
-echo "Hyperparms : epochs=$EPOCHS batch=$BATCH_SIZE target=$TARGET_POOL samples_per_triple=$SAMPLES_PER_TRIPLE"
+echo "Project        : $PROJECT_DIR"
+echo "Env            : $CONDA_ENV"
+echo "Results        : $RESULTS_DIR"
+echo "Dataset        : $DATASET_DIR"
+echo "Checkpoint     : $CKPT_PATH"
+echo "Hashmap out    : $HASHMAP_PATH"
+echo "Hyperparms     : epochs=$EPOCHS batch=$BATCH_SIZE export_batch=$EXPORT_BATCH_SIZE"
 echo "----------------------------------------------------------------------"
 
 nvidia-smi || echo "WARNING: nvidia-smi failed (no GPU visible?)"
@@ -103,21 +102,21 @@ python "$PROJECT_DIR/scripts/train_gan.py" \
     --batch-size "$BATCH_SIZE" \
     --device     cuda
 
-# ─── 2/2: sample + preflight (sampling script aborts on preflight fail) ─
-echo "[$(date)]  Sampling: $PROJECT_DIR/scripts/generate_gan_tsv.py"
-python "$PROJECT_DIR/scripts/generate_gan_tsv.py" \
-    --data               "$PROJECT_DIR/$DATASET_DIR" \
-    --ckpt               "$PROJECT_DIR/$CKPT_PATH" \
-    --target             "$TARGET_POOL" \
-    --samples-per-triple "$SAMPLES_PER_TRIPLE" \
-    --out                "$PROJECT_DIR/$TSV_PATH" \
-    --device             cuda
+# ─── 2/2: export hashmap + preflight (script aborts on preflight fail) ──
+echo "[$(date)]  Exporting hashmap: $PROJECT_DIR/scripts/generate_gan_hashmap.py"
+python "$PROJECT_DIR/scripts/generate_gan_hashmap.py" \
+    --data        "$PROJECT_DIR/$DATASET_DIR" \
+    --ckpt        "$PROJECT_DIR/$CKPT_PATH" \
+    --out         "$PROJECT_DIR/$HASHMAP_PATH" \
+    --batch-size  "$EXPORT_BATCH_SIZE" \
+    --device      cuda
 
 # Copy the deliverable into scratch alongside the SLURM logs so it survives
 # whatever happens to outputs/ in the project tree (which is gitignored).
-cp "$PROJECT_DIR/$TSV_PATH" "$RESULTS_DIR/"
-echo "[$(date)]  Copied $TSV_PATH -> $RESULTS_DIR/"
+cp "$PROJECT_DIR/$HASHMAP_PATH" "$RESULTS_DIR/"
+echo "[$(date)]  Copied $HASHMAP_PATH -> $RESULTS_DIR/"
 
 echo "----------------------------------------------------------------------"
-echo "Done $(date). TSV in: $RESULTS_DIR/$(basename "$TSV_PATH")"
-echo "Next: scp $RESULTS_DIR/$(basename "$TSV_PATH") <wherever-ADKGD-lives>/data/FB15K/gan_negatives.tsv"
+echo "Done $(date). Hashmap in: $RESULTS_DIR/$(basename "$HASHMAP_PATH")"
+echo "Next: scp $RESULTS_DIR/$(basename "$HASHMAP_PATH") <wherever-ADKGD-lives>/data/FB15K/gan_hashmap.tsv"
+echo "Then on ADKGD side: --neg_source gan_hashmap --gan_hashmap_path data/FB15K/gan_hashmap.tsv"
